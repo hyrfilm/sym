@@ -1,0 +1,4 @@
+[profile]
+name = "symd-nix"
+type = "nix"
+location = ".sym/profiles/symd-nix"
