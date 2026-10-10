@@ -2,9 +2,13 @@
 let
   inherit (pkgs) lib;
   version = "0.1.0";
-  beam = pkgs.beamPackages.overrideScope (_final: prev: {
-    elixir = prev.elixir_1_20;
-  });
+  # Newer nixpkgs expose `extend` on the beam scope, older ones
+  # `overrideScope`; accept either so a consumer's `follows` works.
+  beam = (pkgs.beamPackages.extend or pkgs.beamPackages.overrideScope) (
+    _final: prev: {
+      elixir = prev.elixir_1_20;
+    }
+  );
 
   # Only source files enter the build. Local profiles, Mix caches, and binaries
   # mustn't become part of the package or affect its dependency hash.
