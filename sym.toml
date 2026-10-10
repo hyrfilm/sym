@@ -8,5 +8,5 @@ args = ["--stdio"]
 extensions = [".ts", ".tsx", ".js", ".jsx"]
 [lsp.elixir]
 command = "dexter"
-args = ["--stdio"]
+args = ["lsp"]
 extensions = [".ex", ".exs"]

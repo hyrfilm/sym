@@ -274,6 +274,9 @@ defmodule Symd.Lsp.Client do
         "rootUri" => uri,
         "workspaceFolders" => [%{"uri" => uri, "name" => Path.basename(root)}],
         "capabilities" => %{
+          # Without workDoneProgress the server never reports indexing, and
+          # await_quiet would wave cold queries through a half-loaded project.
+          "window" => %{"workDoneProgress" => true},
           "general" => %{"positionEncodings" => ["utf-16"]},
           "textDocument" => %{
             "documentSymbol" => %{"hierarchicalDocumentSymbolSupport" => true},

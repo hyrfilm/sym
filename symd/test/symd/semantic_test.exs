@@ -312,6 +312,60 @@ defmodule Symd.SemanticTest do
     assert %{"name" => "parse", "kind" => "function", "line" => 2} = hd(candidates)
   end
 
+  test "elixir-style qualified names match bare, dotted, and arity queries" do
+    # dexter reports "Symd.Servers.stop_root/1" as the whole name; tsserver
+    # would report "stop_root" with containerName. Both must be findable
+    # with the same queries — including pasting a suggestion back in.
+    infos = [
+      %{
+        "name" => "Symd.Servers.stop_root/1",
+        "kind" => 12,
+        # dexter repeats the module path here; it must not print doubled.
+        "containerName" => "Symd.Servers",
+        "location" => %{
+          "uri" => "file:///missing/servers.ex",
+          "range" => %{"start" => %{"line" => 30, "character" => 2}}
+        }
+      },
+      %{
+        "name" => "Other.Module.stop_root/2",
+        "kind" => 12,
+        "location" => %{
+          "uri" => "file:///missing/other.ex",
+          "range" => %{"start" => %{"line" => 5, "character" => 2}}
+        }
+      }
+    ]
+
+    workspace =
+      workspace(
+        root: "/nowhere-to-seed",
+        sync: fn _lsp, _path -> {:ok, ""} end,
+        request: fn _lsp, "workspace/symbol", _params -> {:ok, infos} end
+      )
+
+    both = fn name ->
+      case Semantic.definition(workspace, name) do
+        {:ok, %{"definitions" => definitions}} -> Enum.map(definitions, & &1["path"])
+        {:error, {:symbol_not_found, _name, _similar}} -> :not_found
+      end
+    end
+
+    assert both.("stop_root") == ["/missing/servers.ex", "/missing/other.ex"]
+    assert both.("Servers.stop_root") == ["/missing/servers.ex"]
+    assert both.("Symd.Servers.stop_root") == ["/missing/servers.ex"]
+    assert both.("Symd.Servers.stop_root/1") == ["/missing/servers.ex"]
+    assert both.("stop_root/2") == ["/missing/other.ex"]
+    assert both.("stop_root/3") == :not_found
+    assert both.("Wrong.stop_root") == :not_found
+
+    assert {:ok, %{"definitions" => [definition]}} =
+             Semantic.definition(workspace, "Symd.Servers.stop_root/1")
+
+    assert definition["name"] == "Symd.Servers.stop_root/1"
+    refute Map.has_key?(definition, "container")
+  end
+
   test "a broken server does not hide another server's answer" do
     other = %{name: "other", command: "x", args: [], extensions: [".zz"]}
 
@@ -342,7 +396,7 @@ defmodule Symd.SemanticTest do
     assert {:ok, %{"definitions" => [_definition]}} = Semantic.definition(workspace, "parse")
   end
 
-  test "when every server fails, the real error surfaces" do
+  test "when every server fails, the real error surfaces, naming the server" do
     workspace =
       workspace(
         root: "/nowhere-to-seed",
@@ -350,6 +404,60 @@ defmodule Symd.SemanticTest do
         request: fn _lsp, "workspace/symbol", _params -> {:error, {:server_exited, 1}} end
       )
 
-    assert Semantic.references(workspace, "parse") == {:error, {:server_exited, 1}}
+    assert Semantic.references(workspace, "parse") ==
+             {:error, {:lsp_failed, "typescript", {:server_exited, 1}}}
+  end
+
+  @tag :tmp_dir
+  test "name queries seed a file below the root, source directories first", %{tmp_dir: dir} do
+    # A root-level file is usually build config (vite.config.ts) belonging
+    # to a side project; seeding it leaves tsserver unable to answer
+    # workspace/symbol for the application's own symbols.
+    File.write!(Path.join(dir, "vite.config.ts"), "")
+    File.mkdir_p!(Path.join(dir, "e2e"))
+    File.write!(Path.join(dir, "e2e/smoke.ts"), "")
+    File.mkdir_p!(Path.join(dir, "src"))
+    File.write!(Path.join(dir, "src/app.ts"), "")
+
+    parent = self()
+
+    workspace =
+      workspace(
+        root: dir,
+        sync: fn @typescript, path ->
+          send(parent, {:seeded, path})
+          {:ok, ""}
+        end,
+        request: fn @typescript, "workspace/symbol", _params -> {:ok, []} end
+      )
+
+    assert {:error, {:symbol_not_found, _name, _similar}} =
+             Semantic.definition(workspace, "Missing")
+
+    assert_received {:seeded, seeded}
+    assert seeded == Path.join(dir, "src/app.ts")
+  end
+
+  @tag :tmp_dir
+  test "a root-level file still seeds when nothing deeper exists", %{tmp_dir: dir} do
+    File.write!(Path.join(dir, "vite.config.ts"), "")
+
+    parent = self()
+
+    workspace =
+      workspace(
+        root: dir,
+        sync: fn @typescript, path ->
+          send(parent, {:seeded, path})
+          {:ok, ""}
+        end,
+        request: fn @typescript, "workspace/symbol", _params -> {:ok, []} end
+      )
+
+    assert {:error, {:symbol_not_found, _name, _similar}} =
+             Semantic.definition(workspace, "Missing")
+
+    assert_received {:seeded, seeded}
+    assert seeded == Path.join(dir, "vite.config.ts")
   end
 end

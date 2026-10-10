@@ -2,9 +2,10 @@
 let
   inherit (pkgs) lib;
   version = "0.1.0";
-  # Newer nixpkgs expose `extend` on the beam scope, older ones
-  # `overrideScope`; accept either so a consumer's `follows` works.
-  beam = (pkgs.beamPackages.extend or pkgs.beamPackages.overrideScope) (
+  # Recent nixpkgs expose `overrideScope` on the beam scope and make `extend`
+  # a throwing alias; before autumn 2026 it was `extend` only. Prefer
+  # overrideScope so both this flake's pin and a consumer's `follows` build.
+  beam = (pkgs.beamPackages.overrideScope or pkgs.beamPackages.extend) (
     _final: prev: {
       elixir = prev.elixir_1_20;
     }

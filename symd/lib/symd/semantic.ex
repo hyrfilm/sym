@@ -82,12 +82,12 @@ defmodule Symd.Semantic do
   # Name resolution ---------------------------------------------------------
 
   defp find_symbols(workspace, full_name) do
-    {container, base} = split_name(full_name)
+    query = parse_symbol_name(full_name)
 
-    with {:ok, answers} <- fan_out(workspace, base) do
+    with {:ok, answers} <- fan_out(workspace, query.base) do
       matches =
         answers
-        |> Enum.filter(fn {_lsp, info} -> exact?(info, base, container) end)
+        |> Enum.filter(fn {_lsp, info} -> exact?(info, query) end)
         |> Enum.flat_map(fn {lsp, info} ->
           case workspace_symbol(info) do
             nil -> []
@@ -97,7 +97,7 @@ defmodule Symd.Semantic do
         |> Enum.uniq_by(fn {_lsp, symbol} -> Map.take(symbol, ["path", "line", "column"]) end)
 
       case matches do
-        [] -> {:error, {:symbol_not_found, full_name, similar(answers, base)}}
+        [] -> {:error, {:symbol_not_found, full_name, similar(answers, query.base)}}
         matches -> {:ok, matches}
       end
     end
@@ -114,7 +114,10 @@ defmodule Symd.Semantic do
       end)
 
     answers = for {lsp, {:ok, infos}} <- results, is_list(infos), info <- infos, do: {lsp, info}
-    errors = for {_lsp, {:error, reason}} <- results, do: reason
+
+    # Name the failing server: with several configured, "a language server
+    # exited" without saying which one sends the reader to the wrong place.
+    errors = for {lsp, {:error, reason}} <- results, do: {:lsp_failed, lsp.name, reason}
 
     case {answers, errors} do
       {[], [reason | _rest]} -> {:error, reason}
@@ -123,10 +126,14 @@ defmodule Symd.Semantic do
   end
 
   # Some servers (tsserver among them) can't answer workspace/symbol until a
-  # file of the project is open. Syncing one representative file is a cheap
+  # file of the project is open — and tsserver scopes the search to the
+  # project of the file it most recently saw. A root-level file is usually
+  # build configuration (vite.config.ts) belonging to a side project, so
+  # prefer a file below the root, source directories first, and fall back to
+  # a root-level file only when nothing deeper exists. Syncing is a cheap
   # no-op on every query after the first.
   defp seed(workspace, lsp) do
-    case seed_file([workspace.root], lsp.extensions, 0) do
+    case seed_file([workspace.root], lsp.extensions, 0, nil) do
       nil -> :ok
       path -> workspace.sync.(lsp, path)
     end
@@ -136,11 +143,12 @@ defmodule Symd.Semantic do
   defp settle(%Workspace{settle: settle}, lsp), do: settle.(lsp)
 
   @skipped_directories ~w(node_modules deps _build target dist build out vendor)
+  @preferred_directories %{"src" => 0, "lib" => 1, "apps" => 2}
 
-  defp seed_file([], _extensions, _visited), do: nil
-  defp seed_file(_queue, _extensions, visited) when visited > 512, do: nil
+  defp seed_file([], _extensions, _visited, fallback), do: fallback
+  defp seed_file(_queue, _extensions, visited, fallback) when visited > 512, do: fallback
 
-  defp seed_file([directory | queue], extensions, visited) do
+  defp seed_file([directory | queue], extensions, visited, fallback) do
     entries =
       case File.ls(directory) do
         {:ok, entries} -> Enum.sort(entries)
@@ -154,7 +162,7 @@ defmodule Symd.Semantic do
         (String.downcase(Path.extname(entry)) in extensions and File.regular?(path)) && path
       end)
 
-    if found do
+    if found != nil and visited > 0 do
       found
     else
       subdirectories =
@@ -165,7 +173,12 @@ defmodule Symd.Semantic do
             File.dir?(path),
             do: path
 
-      seed_file(queue ++ subdirectories, extensions, visited + 1)
+      subdirectories =
+        Enum.sort_by(subdirectories, fn path ->
+          {Map.get(@preferred_directories, Path.basename(path), 9), path}
+        end)
+
+      seed_file(queue ++ subdirectories, extensions, visited + 1, fallback || found)
     end
   end
 
@@ -176,24 +189,71 @@ defmodule Symd.Semantic do
     end
   end
 
-  defp exact?(%{"name" => name} = info, base, container) do
-    name == base and (container == nil or info["containerName"] == container)
+  # Servers disagree about what goes into a workspace symbol's name: tsserver
+  # reports a bare identifier with the parent in containerName, while dexter
+  # reports "Symd.Servers.stop_root/1" with no container at all. Queries and
+  # candidates are both parsed into container/base/arity, so the same query
+  # works against either convention — and a suggestion can be pasted back in.
+  defp exact?(%{"name" => name} = info, query) do
+    candidate = parse_symbol_name(name, info["containerName"])
+
+    candidate.base == query.base and
+      container_matches?(candidate.container, query.container) and
+      arity_matches?(candidate.arity, query.arity)
   end
 
-  defp exact?(_info, _base, _container), do: false
+  defp exact?(_info, _query), do: false
+
+  defp parse_symbol_name(full, outer \\ nil) do
+    {bare, arity} =
+      case Regex.run(~r{\A(.+)/(\d+)\z}, full) do
+        [_all, bare, arity] -> {bare, String.to_integer(arity)}
+        nil -> {full, nil}
+      end
+
+    {container, base} = split_name(bare)
+    %{container: join_container(outer, container), base: base, arity: arity}
+  end
+
+  # dexter puts the module path in containerName AND in the name; joining
+  # blindly would yield Symd.Servers.Symd.Servers.stop_root.
+  defp join_container(outer, inner) do
+    cond do
+      outer in [nil, ""] -> presence(inner)
+      inner in [nil, ""] -> presence(outer)
+      inner == outer or String.starts_with?(inner, outer <> ".") -> inner
+      true -> outer <> "." <> inner
+    end
+  end
+
+  defp presence(""), do: nil
+  defp presence(value), do: value
+
+  # A dotted query narrows by container suffix: Servers.stop_root matches a
+  # candidate whose container is Symd.Servers.
+  defp container_matches?(_candidate, nil), do: true
+  defp container_matches?(nil, _wanted), do: false
+
+  defp container_matches?(candidate, wanted),
+    do: candidate == wanted or String.ends_with?(candidate, "." <> wanted)
+
+  defp arity_matches?(_candidate, nil), do: true
+  defp arity_matches?(candidate, arity), do: candidate == arity
 
   defp workspace_symbol(%{"name" => name, "kind" => kind} = info) do
     with %{"uri" => uri, "range" => %{"start" => start}} <- info["location"],
          {:ok, path} <- Uri.to_path(uri) do
       # Servers anchor these ranges at the declaration's first keyword;
-      # re-anchor on the identifier so def and symbols agree on columns.
+      # re-anchor on the identifier (the parsed base — a qualified name
+      # never appears verbatim in the source line) so def and symbols agree.
       text = line_text(path, start["line"])
-      column = Position.find_name(text, name, Position.column(text, start["character"]))
+      anchor = parse_symbol_name(name).base
+      column = Position.find_name(text, anchor, Position.column(text, start["character"]))
 
       prune(%{
         "name" => name,
         "kind" => kind_name(kind),
-        "container" => info["containerName"],
+        "container" => displayed_container(name, info["containerName"]),
         "path" => path,
         "line" => start["line"] + 1,
         "column" => column
@@ -202,6 +262,15 @@ defmodule Symd.Semantic do
       # Without a resolvable location there is nothing to point an agent at.
       _other -> nil
     end
+  end
+
+  # A container that is already spelled out inside the name (dexter) would
+  # print doubled; keep it only when it adds information (tsserver).
+  defp displayed_container(name, container) do
+    if is_binary(container) and
+         (name == container or String.starts_with?(name, container <> ".")),
+       do: nil,
+       else: container
   end
 
   defp similar(answers, base) do
@@ -218,7 +287,7 @@ defmodule Symd.Semantic do
       # The symbol's range may start at a keyword; references wants the
       # cursor on the identifier itself.
       text = Enum.at(lines(content), symbol["line"] - 1) || ""
-      column = Position.find_name(text, symbol["name"], symbol["column"])
+      column = Position.find_name(text, parse_symbol_name(symbol["name"]).base, symbol["column"])
 
       params = %{
         "textDocument" => %{"uri" => Uri.from_path(symbol["path"])},

@@ -122,6 +122,7 @@ defmodule Symd.Service do
   defp reply({:error, reason}), do: error(code(reason), reason)
 
   # Stable codes for clients; the message is for the person reading it.
+  defp code({:lsp_failed, _name, reason}), do: code(reason)
   defp code({:no_workspace, _cwd}), do: "no_workspace"
   defp code({:no_config, _root, _global}), do: "no_config"
   defp code({:config_unreadable, _path, _posix}), do: "invalid_config"
@@ -151,6 +152,8 @@ defmodule Symd.Service do
   Explains failures returned by the semantic layer or transport. The
   executable uses the same messages for startup errors.
   """
+  def message({:lsp_failed, name, reason}), do: "[#{name}] #{message(reason)}"
+
   def message({:no_workspace, cwd}),
     do: "no workspace found from #{cwd}: no sym.toml or .git here or in any parent directory"
 

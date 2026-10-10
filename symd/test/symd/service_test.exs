@@ -95,7 +95,8 @@ defmodule Symd.ServiceTest do
           {{:no_workspace, "/somewhere"}, "no_workspace"},
           {{:no_config, "/repo", "/home/.config/sym/sym.toml"}, "no_config"},
           {{:config_unreadable, "/repo/sym.toml", :eacces}, "invalid_config"},
-          {{:invalid_config, "/repo/sym.toml", "invalid TOML"}, "invalid_config"}
+          {{:invalid_config, "/repo/sym.toml", "invalid TOML"}, "invalid_config"},
+          {{:lsp_failed, "elixir", {:server_exited, 1}}, "lsp_unavailable"}
         ] do
       deps = [fetch: fn _cwd -> {:error, reason} end]
 
@@ -136,6 +137,7 @@ defmodule Symd.ServiceTest do
           {{:symbol_not_found, "parse", ["parser"]}, "the servers suggest: parser"},
           {{:executable_not_found, "tls"}, "executable not found: tls"},
           {{:server_exited, 127}, "exited with status 127"},
+          {{:lsp_failed, "elixir", {:server_exited, 1}}, "[elixir] the language server exited"},
           {:lsp_timeout, "timed out waiting for the language server"},
           {{:lsp_error, -32601, "unhandled method"}, "unhandled method"},
           {{:file_read, "/x.ts", :enoent}, "no such file"}
