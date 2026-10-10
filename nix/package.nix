@@ -56,9 +56,13 @@ pkgs.runCommand "sym-${version}" {
     platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 } ''
-  mkdir -p "$out/bin"
+  mkdir -p "$out/bin" "$out/share/sym"
   # Copy the Go binary: os.Executable must find the adjacent symd in this
   # combined output, even when sym itself is reached through a profile symlink.
   cp ${client}/bin/cli "$out/bin/sym"
   ln -s ${service}/bin/symd "$out/bin/symd"
+  # Reference material for declarative setups: the agent skill file and an
+  # example global config (~/.config/sym/sym.toml).
+  cp ${../skills/sym/SKILL.md} "$out/share/sym/SKILL.md"
+  cp ${../examples/sym.toml} "$out/share/sym/sym.toml"
 ''

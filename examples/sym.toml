@@ -1,0 +1,22 @@
+# Global sym configuration — lives at ~/.config/sym/sym.toml and covers any
+# git repository that has no sym.toml of its own. Each [lsp.<name>] table
+# points at one language server; sym starts it on demand and never installs
+# or manages it. `command` is an executable name looked up on PATH, or a
+# path resolved against this file's directory.
+
+[lsp.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+extensions = [".ts", ".tsx", ".js", ".jsx"]
+
+# [lsp.go]
+# command = "gopls"
+# extensions = [".go"]
+
+# [lsp.rust]
+# command = "rust-analyzer"
+# extensions = [".rs"]
+
+# [lsp.elixir]
+# command = "elixir-ls"
+# extensions = [".ex", ".exs", ".heex"]

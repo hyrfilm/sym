@@ -87,6 +87,11 @@ it to `~/.claude/skills/sym/SKILL.md` (or a project's `.claude/skills/sym/`)
 so agents reach for `sym` instead of grep. It is deliberately free of setup
 instructions, because the tool needs none.
 
+The Nix package also installs reference copies for declarative setups —
+`share/sym/SKILL.md` and an example global config at `share/sym/sym.toml`
+([examples/sym.toml](examples/sym.toml)) — so a home-manager or nix-darwin
+flake can link them into place instead of copying by hand.
+
 ## Answers
 
 The default output is one `path:line:col` per line — the shape every tool
