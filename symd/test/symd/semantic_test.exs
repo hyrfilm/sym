@@ -23,6 +23,13 @@ defmodule Symd.SemanticTest do
     )
   end
 
+  # Name queries only consult servers whose extensions exist in the
+  # workspace, so tests of them need a root containing matching files.
+  defp seedable!(dir, files) do
+    for file <- files, do: File.write!(Path.join(dir, file), "")
+    dir
+  end
+
   test "symbols flattens hierarchical document symbols in file order" do
     content = "class Parser {\n  parse(input: string) {}\n}\nfunction parse() {}\n"
 
@@ -194,10 +201,11 @@ defmodule Symd.SemanticTest do
               }}
   end
 
-  test "an unknown name reports what the servers found instead" do
+  @tag :tmp_dir
+  test "an unknown name reports what the servers found instead", %{tmp_dir: dir} do
     workspace =
       workspace(
-        root: "/nowhere-to-seed",
+        root: seedable!(dir, ["a.ts"]),
         sync: fn _lsp, _path -> {:ok, ""} end,
         request: fn _lsp, "workspace/symbol", _params ->
           {:ok,
@@ -281,7 +289,8 @@ defmodule Symd.SemanticTest do
     assert_received {:synced, ^declaration}
   end
 
-  test "heavy ambiguity returns candidates instead of a pile of lookups" do
+  @tag :tmp_dir
+  test "heavy ambiguity returns candidates instead of a pile of lookups", %{tmp_dir: dir} do
     infos =
       for index <- 1..6 do
         %{
@@ -296,7 +305,7 @@ defmodule Symd.SemanticTest do
 
     workspace =
       workspace(
-        root: "/nowhere-to-seed",
+        root: seedable!(dir, ["a.ts"]),
         sync: fn _lsp, _path -> {:ok, ""} end,
         request: fn
           _lsp, "workspace/symbol", _params ->
@@ -312,7 +321,8 @@ defmodule Symd.SemanticTest do
     assert %{"name" => "parse", "kind" => "function", "line" => 2} = hd(candidates)
   end
 
-  test "elixir-style qualified names match bare, dotted, and arity queries" do
+  @tag :tmp_dir
+  test "elixir-style qualified names match bare, dotted, and arity queries", %{tmp_dir: dir} do
     # dexter reports "Symd.Servers.stop_root/1" as the whole name; tsserver
     # would report "stop_root" with containerName. Both must be findable
     # with the same queries — including pasting a suggestion back in.
@@ -339,7 +349,7 @@ defmodule Symd.SemanticTest do
 
     workspace =
       workspace(
-        root: "/nowhere-to-seed",
+        root: seedable!(dir, ["a.ts"]),
         sync: fn _lsp, _path -> {:ok, ""} end,
         request: fn _lsp, "workspace/symbol", _params -> {:ok, infos} end
       )
@@ -366,12 +376,13 @@ defmodule Symd.SemanticTest do
     refute Map.has_key?(definition, "container")
   end
 
-  test "a broken server does not hide another server's answer" do
+  @tag :tmp_dir
+  test "a broken server does not hide another server's answer", %{tmp_dir: dir} do
     other = %{name: "other", command: "x", args: [], extensions: [".zz"]}
 
     workspace =
       workspace(
-        root: "/nowhere-to-seed",
+        root: seedable!(dir, ["a.zz", "a.ts"]),
         lsps: [other, @typescript],
         sync: fn _lsp, _path -> {:ok, ""} end,
         request: fn
@@ -396,16 +407,59 @@ defmodule Symd.SemanticTest do
     assert {:ok, %{"definitions" => [_definition]}} = Semantic.definition(workspace, "parse")
   end
 
-  test "when every server fails, the real error surfaces, naming the server" do
+  @tag :tmp_dir
+  test "when every server fails, the real error surfaces, naming the server", %{tmp_dir: dir} do
     workspace =
       workspace(
-        root: "/nowhere-to-seed",
+        root: seedable!(dir, ["a.ts"]),
         sync: fn _lsp, _path -> {:ok, ""} end,
         request: fn _lsp, "workspace/symbol", _params -> {:error, {:server_exited, 1}} end
       )
 
     assert Semantic.references(workspace, "parse") ==
              {:error, {:lsp_failed, "typescript", {:server_exited, 1}}}
+  end
+
+  @tag :tmp_dir
+  test "a server with no matching files is never consulted or started", %{tmp_dir: dir} do
+    # The request stub only accepts @typescript: a call for the other server
+    # would crash the query. dexter in a TypeScript-only repo stays cold.
+    other = %{name: "other", command: "x", args: [], extensions: [".zz"]}
+
+    workspace =
+      workspace(
+        root: seedable!(dir, ["a.ts"]),
+        lsps: [other, @typescript],
+        sync: fn @typescript, _path -> {:ok, ""} end,
+        request: fn @typescript, "workspace/symbol", _params ->
+          {:ok,
+           [
+             %{
+               "name" => "parse",
+               "kind" => 12,
+               "location" => %{
+                 "uri" => "file:///missing/a.ts",
+                 "range" => %{"start" => %{"line" => 0, "character" => 0}}
+               }
+             }
+           ]}
+        end
+      )
+
+    assert {:ok, %{"definitions" => [_definition]}} = Semantic.definition(workspace, "parse")
+  end
+
+  @tag :tmp_dir
+  test "a workspace no configured server has files for is a clear error", %{tmp_dir: dir} do
+    workspace =
+      workspace(
+        root: dir,
+        sync: fn _lsp, path -> flunk("synced #{path} in an unrelated workspace") end,
+        request: fn _lsp, method, _params -> flunk("sent #{method} in an unrelated workspace") end
+      )
+
+    assert Semantic.definition(workspace, "parse") ==
+             {:error, {:no_lsp_for_workspace, dir, [".ts", ".tsx"]}}
   end
 
   @tag :tmp_dir

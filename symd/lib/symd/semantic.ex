@@ -4,10 +4,12 @@ defmodule Symd.Semantic do
   of files, names, and 1-based locations, hiding LSP's method shapes and
   UTF-16 coordinates.
 
-  Name queries fan out to every configured LSP and come back grouped per
-  matching symbol, up to a small cap, so the common case is answered in one
-  call and heavy ambiguity returns candidates to narrow with a qualified name
-  or an exact location. Locations are authoritative; names are search terms.
+  Name queries fan out to every configured LSP that has matching files in
+  the workspace — the extensions route name queries just as they route file
+  queries, and a server with nothing to read is never started. Answers come
+  back grouped per matching symbol, up to a small cap, so the common case is
+  answered in one call and heavy ambiguity returns candidates to narrow with
+  a qualified name or an exact location. Locations are authoritative; names are search terms.
   Files are read from disk for every query: agents edit files between
   queries, and a confidently stale answer is worse than no tool at all.
   """
@@ -103,15 +105,16 @@ defmodule Symd.Semantic do
     end
   end
 
-  # Ask every configured server; a broken server must not hide another's
-  # answer, but when nobody can answer, the caller gets the real error.
+  # Ask every server that has matching files in the workspace; the rest are
+  # skipped and never even started. A broken server must not hide another's
+  # answer, but when nobody answers, the caller gets the real error.
   defp fan_out(%Workspace{lsps: lsps} = workspace, query) do
     results =
-      Enum.map(lsps, fn lsp ->
-        seed(workspace, lsp)
+      for lsp <- lsps, path = seed(workspace, lsp) do
+        workspace.sync.(lsp, path)
         settle(workspace, lsp)
         {lsp, workspace.request.(lsp, "workspace/symbol", %{"query" => query})}
-      end)
+      end
 
     answers = for {lsp, {:ok, infos}} <- results, is_list(infos), info <- infos, do: {lsp, info}
 
@@ -119,25 +122,27 @@ defmodule Symd.Semantic do
     # exited" without saying which one sends the reader to the wrong place.
     errors = for {lsp, {:error, reason}} <- results, do: {:lsp_failed, lsp.name, reason}
 
-    case {answers, errors} do
-      {[], [reason | _rest]} -> {:error, reason}
-      _any -> {:ok, answers}
+    cond do
+      answers != [] -> {:ok, answers}
+      errors != [] -> {:error, hd(errors)}
+      results == [] -> {:error, no_lsp_for_workspace(workspace)}
+      true -> {:ok, []}
     end
   end
 
-  # Some servers (tsserver among them) can't answer workspace/symbol until a
-  # file of the project is open — and tsserver scopes the search to the
-  # project of the file it most recently saw. A root-level file is usually
-  # build configuration (vite.config.ts) belonging to a side project, so
-  # prefer a file below the root, source directories first, and fall back to
-  # a root-level file only when nothing deeper exists. Syncing is a cheap
-  # no-op on every query after the first.
-  defp seed(workspace, lsp) do
-    case seed_file([workspace.root], lsp.extensions, 0, nil) do
-      nil -> :ok
-      path -> workspace.sync.(lsp, path)
-    end
+  defp no_lsp_for_workspace(%Workspace{root: root, lsps: lsps}) do
+    {:no_lsp_for_workspace, root, Enum.flat_map(lsps, & &1.extensions)}
   end
+
+  # The seed is both the participation test and the wake-up call: a file
+  # matching the server's extensions proves the workspace concerns it, and
+  # some servers (tsserver among them) can't answer workspace/symbol until a
+  # project file is open. tsserver also scopes the search to the project of
+  # the file it most recently saw, and a root-level file is usually build
+  # configuration (vite.config.ts) belonging to a side project — so prefer a
+  # file below the root, source directories first, with a root-level file as
+  # the last resort. Syncing is a cheap no-op on every query after the first.
+  defp seed(workspace, lsp), do: seed_file([workspace.root], lsp.extensions, 0, nil)
 
   defp settle(%Workspace{settle: nil}, _lsp), do: :ok
   defp settle(%Workspace{settle: settle}, lsp), do: settle.(lsp)

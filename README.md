@@ -105,8 +105,10 @@ src/foo.ts:17:5
 src/bar.ts:82:11
 ```
 
-Names are search terms; locations are authoritative. A dotted name
-(`Parser.parse`) narrows by container. When a name matches several symbols,
+Names are search terms; locations are authoritative. A name query consults
+every configured server that has matching files in the workspace — a
+TypeScript repo never boots the Elixir server, however many servers the
+global config lists. A dotted name (`Parser.parse`) narrows by container. When a name matches several symbols,
 the reply groups references per symbol; past five matches it returns the
 candidate definitions instead and exits with status 3, so an agent knows to
 narrow with a qualified name or `--at FILE:LINE:COL` rather than parse refs.

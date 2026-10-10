@@ -39,6 +39,11 @@ func TestDaemonLifecycle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(project, "sym.toml"), []byte(toml), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// A matching file makes the absent server participate in name queries;
+	// without one it would be skipped instead of failing loudly.
+	if err := os.WriteFile(filepath.Join(project, "code.zz"), []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
 	// No sym.toml and no .git anywhere above it.
 	outside := filepath.Join(dir, "outside")
 	if err := os.MkdirAll(outside, 0700); err != nil {

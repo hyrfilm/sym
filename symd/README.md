@@ -48,8 +48,10 @@ injected, so the semantic layer tests against canned LSP replies.
 `Symd.Semantic` answers in files, names, and 1-based codepoint columns,
 hiding LSP's method shapes and UTF-16 offsets (`Symd.Position` converts, per
 line of text). Name queries fan out `workspace/symbol` to every configured
-LSP, filter exact matches (a dotted name matches the container), re-anchor on
-the identifier, and group references per symbol up to a cap of five; past it
+LSP that has matching files in the workspace — a server with nothing to read
+is never started — filter exact matches (a dotted name matches the
+container, Elixir-style `Mod.fun/1` names are normalized), re-anchor on the
+identifier, and group references per symbol up to a cap of five; past it
 they return candidates so the caller narrows instead of waiting. Locations
 are authoritative; names are search terms. Files are read from disk on every
 query, and location-less or non-`file://` results are dropped rather than

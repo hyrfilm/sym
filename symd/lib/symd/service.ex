@@ -128,6 +128,7 @@ defmodule Symd.Service do
   defp code({:config_unreadable, _path, _posix}), do: "invalid_config"
   defp code({:invalid_config, _path, _detail}), do: "invalid_config"
   defp code({:no_lsp_for_path, _path, _extensions}), do: "unsupported_file"
+  defp code({:no_lsp_for_workspace, _root, _extensions}), do: "unsupported_workspace"
   defp code({:symbol_not_found, _name, _similar}), do: "symbol_not_found"
   defp code({:file_read, _path, _reason}), do: "file_unreadable"
   defp code({:executable_not_found, _command}), do: "lsp_unavailable"
@@ -168,6 +169,11 @@ defmodule Symd.Service do
 
   def message({:no_lsp_for_path, path, extensions}),
     do: "no configured LSP handles #{path}; configured extensions: #{Enum.join(extensions, " ")}"
+
+  def message({:no_lsp_for_workspace, root, extensions}),
+    do:
+      "no configured language server has matching files under #{root}; " <>
+        "configured extensions: #{Enum.join(extensions, " ")}"
 
   def message({:symbol_not_found, name, []}), do: ~s(no symbol named "#{name}")
 
