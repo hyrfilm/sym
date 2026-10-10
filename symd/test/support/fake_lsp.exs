@@ -44,6 +44,10 @@ defmodule FakeLsp do
     Map.update!(documents, uri, &%{&1 | "version" => version, "text" => text})
   end
 
+  defp handle(%{"method" => "textDocument/didClose", "params" => params}, documents) do
+    Map.delete(documents, params["textDocument"]["uri"])
+  end
+
   defp handle(%{"method" => "test/documents", "id" => id}, documents) do
     respond(id, documents |> Map.values() |> Enum.sort_by(& &1["uri"]))
     documents

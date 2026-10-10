@@ -12,6 +12,9 @@ defmodule Symd.Semantic do
   a qualified name or an exact location. Locations are authoritative; names are search terms.
   Files are read from disk for every query: agents edit files between
   queries, and a confidently stale answer is worse than no tool at all.
+
+  Configured directories each supply one seed file to help the server load
+  projects. The server still determines project membership and search scope.
   """
 
   alias Symd.{Position, Workspace}
@@ -110,11 +113,7 @@ defmodule Symd.Semantic do
   # answer, but when nobody answers, the caller gets the real error.
   defp fan_out(%Workspace{lsps: lsps} = workspace, query) do
     results =
-      for lsp <- lsps, path = seed(workspace, lsp) do
-        workspace.sync.(lsp, path)
-        settle(workspace, lsp)
-        {lsp, workspace.request.(lsp, "workspace/symbol", %{"query" => query})}
-      end
+      for lsp <- lsps, result = search(workspace, lsp, query), result != :skip, do: {lsp, result}
 
     answers = for {lsp, {:ok, infos}} <- results, is_list(infos), info <- infos, do: {lsp, info}
 
@@ -134,6 +133,29 @@ defmodule Symd.Semantic do
     {:no_lsp_for_workspace, root, Enum.flat_map(lsps, & &1.extensions)}
   end
 
+  defp search(workspace, lsp, query) do
+    with {:ok, paths} <- seeds(workspace, lsp) do
+      if paths == [] do
+        :skip
+      else
+        with :ok <- prepare_files(workspace, lsp, paths),
+             do: workspace.request.(lsp, "workspace/symbol", %{"query" => query})
+      end
+    end
+  end
+
+  defp prepare_directories(workspace, %{directories: [_ | _]} = lsp) do
+    with {:ok, paths} <- seeds(workspace, lsp),
+         do: prepare_files(workspace, lsp, paths)
+  end
+
+  defp prepare_directories(_workspace, _lsp), do: :ok
+
+  defp prepare_files(workspace, lsp, paths) do
+    with {:ok, _contents} <- map_ok(paths, &workspace.sync.(lsp, &1)),
+         do: settle(workspace, lsp)
+  end
+
   # The seed is both the participation test and the wake-up call: a file
   # matching the server's extensions proves the workspace concerns it, and
   # some servers (tsserver among them) can't answer workspace/symbol until a
@@ -149,6 +171,59 @@ defmodule Symd.Semantic do
 
   @skipped_directories ~w(node_modules deps _build target dist build out vendor)
   @preferred_directories %{"src" => 0, "lib" => 1, "apps" => 2}
+
+  defp seeds(workspace, %{directories: [_ | _]} = lsp) do
+    with {:ok, paths} <-
+           map_ok(lsp.directories, fn directory ->
+             path = Path.expand(Path.join(workspace.root, directory))
+             directory_seed(path, lsp.extensions)
+           end) do
+      {:ok, paths |> Enum.reject(&is_nil/1) |> Enum.uniq()}
+    end
+  end
+
+  defp seeds(workspace, lsp), do: {:ok, List.wrap(seed(workspace, lsp))}
+
+  defp directory_seed(path, extensions) do
+    case File.ls(path) do
+      {:ok, entries} ->
+        paths =
+          for entry <- Enum.sort(entries),
+              not String.starts_with?(entry, "."),
+              entry not in @skipped_directories,
+              do: Path.join(path, entry)
+
+        first_file(paths, extensions)
+
+      {:error, reason} ->
+        {:error, {:file_read, path, reason}}
+    end
+  end
+
+  defp first_file([], _extensions), do: {:ok, nil}
+
+  defp first_file([path | rest], extensions) do
+    result =
+      case File.lstat(path) do
+        {:ok, %{type: :directory}} ->
+          directory_seed(path, extensions)
+
+        {:ok, %{type: :regular}} ->
+          {:ok, if(String.downcase(Path.extname(path)) in extensions, do: path)}
+
+        # Do not follow nested symlinks out of the selected tree or around cycles.
+        {:ok, _other} ->
+          {:ok, nil}
+
+        {:error, reason} ->
+          {:error, {:file_read, path, reason}}
+      end
+
+    case result do
+      {:ok, nil} -> first_file(rest, extensions)
+      found_or_error -> found_or_error
+    end
+  end
 
   defp seed_file([], _extensions, _visited, fallback), do: fallback
   defp seed_file(_queue, _extensions, visited, fallback) when visited > 512, do: fallback
@@ -313,6 +388,7 @@ defmodule Symd.Semantic do
 
   defp position_params(workspace, %{path: path, line: line, column: column}) do
     with {:ok, lsp} <- lsp_for(workspace, path),
+         :ok <- prepare_directories(workspace, lsp),
          {:ok, content} <- workspace.sync.(lsp, path) do
       # Opening the file may have kicked off a project load; def and refs
       # answered during one are confidently incomplete.

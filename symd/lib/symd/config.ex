@@ -10,10 +10,15 @@ defmodule Symd.Config do
       command = "typescript-language-server"
       args = ["--stdio"]
       extensions = [".ts", ".tsx"]
+      directories = ["src/", "test/"]
 
   `command` is an executable name looked up on PATH, or a path resolved
   against this file's directory. Where that executable came from — nix, npm,
   a checkout — is deliberately not this tool's business.
+
+  Optional `directories` are relative to the workspace root. When present,
+  sym opens one matching file beneath each directory before def/refs queries
+  to help the server discover its projects.
   """
 
   @doc """
@@ -48,8 +53,16 @@ defmodule Symd.Config do
   defp entry(name, %{"command" => command} = table)
        when is_binary(command) and byte_size(command) > 0 do
     with {:ok, args} <- args(name, Map.get(table, "args", [])),
-         {:ok, extensions} <- extensions(name, Map.get(table, "extensions")) do
-      {:ok, %{name: name, command: command, args: args, extensions: extensions}}
+         {:ok, extensions} <- extensions(name, Map.get(table, "extensions")),
+         {:ok, directories} <- directories(name, Map.get(table, "directories", [])) do
+      {:ok,
+       %{
+         name: name,
+         command: command,
+         args: args,
+         extensions: extensions,
+         directories: directories
+       }}
     end
   end
 
@@ -68,5 +81,17 @@ defmodule Symd.Config do
     else
       {:error, ~s([lsp.#{name}] extensions must be a non-empty list like [".ts", ".tsx"])}
     end
+  end
+
+  defp directories(name, directories) do
+    valid_path? = fn path ->
+      is_binary(path) and path != "" and Path.type(path) == :relative and
+        ".." not in Path.split(path)
+    end
+
+    if is_list(directories) and Enum.all?(directories, valid_path?),
+      do: {:ok, directories},
+      else:
+        {:error, "[lsp.#{name}] directories must be a list of workspace-relative directory paths"}
   end
 end

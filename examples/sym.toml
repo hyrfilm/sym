@@ -8,6 +8,9 @@
 command = "typescript-language-server"
 args = ["--stdio"]
 extensions = [".ts", ".tsx", ".js", ".jsx"]
+# Optional, usually in a project's sym.toml: open one seed file per directory.
+# Paths are relative to each workspace root, even in this global config.
+# directories = ["src/", "test/"]
 
 # [lsp.go]
 # command = "gopls"

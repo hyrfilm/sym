@@ -24,14 +24,43 @@ defmodule Symd.ConfigTest do
     assert Config.parse(toml) ==
              {:ok,
               [
-                %{name: "elixir", command: "./bin/dexter", args: [], extensions: [".ex"]},
+                %{
+                  name: "elixir",
+                  command: "./bin/dexter",
+                  args: [],
+                  extensions: [".ex"],
+                  directories: []
+                },
                 %{
                   name: "typescript",
                   command: "typescript-language-server",
                   args: ["--stdio"],
-                  extensions: [".ts", ".tsx"]
+                  extensions: [".ts", ".tsx"],
+                  directories: []
                 }
               ]}
+  end
+
+  test "accepts workspace-relative directories independently of extensions" do
+    assert {:ok, [lsp]} =
+             Config.parse("""
+             [lsp.ts]
+             command = "tls"
+             extensions = [".ts"]
+             directories = ["src/", "test/", "."]
+             """)
+
+    assert lsp.directories == ["src/", "test/", "."]
+
+    for directories <- ["'src'", "[1]", "['']", "['/tmp']", "['../src']", "['src/../../test']"] do
+      assert {:error, "[lsp.ts] directories must be a list of workspace-relative directory paths"} =
+               Config.parse("""
+               [lsp.ts]
+               command = "tls"
+               extensions = [".ts"]
+               directories = #{directories}
+               """)
+    end
   end
 
   test "reports missing lsp tables" do

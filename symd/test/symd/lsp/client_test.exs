@@ -48,8 +48,25 @@ defmodule Symd.Lsp.ClientTest do
     assert {:ok, [%{"uri" => ^uri, "version" => 2, "text" => "two"}]} =
              Client.request(client, "test/documents", %{})
 
+    # Later queries may only sync a seed; previously opened files still refresh.
+    File.write!(path, "three")
+    assert :ok = Client.await_quiet(client)
+
+    assert {:ok, [%{"uri" => ^uri, "version" => 3, "text" => "three"}]} =
+             Client.request(client, "test/documents", %{})
+
     assert {:error, {:file_read, _missing, :enoent}} =
              Client.sync(client, Path.join(dir, "missing.ts"))
+
+    File.rm!(path)
+    assert :ok = Client.await_quiet(client)
+    assert {:ok, []} = Client.request(client, "test/documents", %{})
+
+    File.write!(path, "recreated")
+    assert {:ok, "recreated"} = Client.sync(client, path)
+
+    assert {:ok, [%{"uri" => ^uri, "version" => 1, "text" => "recreated"}]} =
+             Client.request(client, "test/documents", %{})
   end
 
   @tag :tmp_dir

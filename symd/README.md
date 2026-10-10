@@ -10,7 +10,7 @@ queries over a Unix socket. It is normally started by the first `sym` query
 
 ## Transport / service
 
-`Symd.Transport` handles the [CLI / service protocol](../README.md#cli--service-protocol):
+`Symd.Transport` handles the [CLI protocol](#cli-protocol):
 one JSON line each way, one request per connection, request lines limited to
 64 KiB. Each accepted connection runs in its own supervised task, so a slow
 query — a language server starting cold can take seconds — never blocks the
@@ -27,6 +27,26 @@ errors, not guesses — dispatches `symbols`, `def`, and `refs` to the semantic
 layer, and produces result/error envelopes with stable error codes. Status
 and stop are tagged control results handled by the transport.
 
+## CLI protocol
+
+The CLI sends one JSON request line per connection and reads one reply.
+Semantic requests carry `op` (`symbols`, `def`, or `refs`), the caller's
+absolute `cwd`, and either `name` or an absolute `path`. Queries at a
+position also carry `line` and `column`, both starting at 1:
+
+```json
+{"op":"refs","path":"/home/user/project/src/parser.ts","line":42,"column":8,"cwd":"/home/user/project"}
+```
+
+Successful replies use `{"ok":true,"result":{...}}`. Failures use
+`{"ok":false,"error":{"code":"...","message":"..."}}`; the CLI
+prints the error and exits with status 1.
+
+Management requests contain only `op`: `status` or `stop`. Status replies
+include `service: "symd"`, `protocol: 3`, `state: "running"`, the process ID,
+and the resolved workspaces. Stop replies acknowledge `state: "stopping"`;
+the CLI then waits for socket cleanup.
+
 ## Workspaces / configuration
 
 No configuration is read at startup. Every semantic request carries the
@@ -36,7 +56,8 @@ wins in the same directory, and the search never crosses a repository
 boundary). A git root reads the global config, `$XDG_CONFIG_HOME/sym/sym.toml`.
 
 `Symd.Config.parse/1` reads the `[lsp.<name>]` tables: `command`, optional
-`args`, and the `extensions` the server answers for. `Symd.Workspaces`
+`args`, the `extensions` the server answers for, and optional workspace-relative
+`directories`. `Symd.Workspaces`
 caches one `Symd.Workspace` per root, re-reading the config on every request
 and rebuilding — stopping the root's language servers first — when its
 content changes. Config-relative commands resolve against the config file's
@@ -47,15 +68,32 @@ injected, so the semantic layer tests against canned LSP replies.
 
 `Symd.Semantic` answers in files, names, and 1-based codepoint columns,
 hiding LSP's method shapes and UTF-16 offsets (`Symd.Position` converts, per
-line of text). Name queries fan out `workspace/symbol` to every configured
-LSP that has matching files in the workspace — a server with nothing to read
-is never started — filter exact matches (a dotted name matches the
-container, Elixir-style `Mod.fun/1` names are normalized), re-anchor on the
+line of text). Name queries consult every configured LSP with matching files;
+a server with nothing to read is never started. They use `workspace/symbol`
+after opening one seed file by default, or one seed per configured directory.
+Seeds help load projects; the server still determines project membership and
+name-search scope. TypeScript Language Server can scope names to the last
+accessed file's projects, so seeding disconnected projects does not guarantee
+that a name search covers all of them.
+
+Queries filter exact matches (a dotted name matches the container, Elixir-style
+`Mod.fun/1` names are normalized), re-anchor on the
 identifier, and group references per symbol up to a cap of five; past it
 they return candidates so the caller narrows instead of waiting. Locations
 are authoritative; names are search terms. Files are read from disk on every
 query, and location-less or non-`file://` results are dropped rather than
 guessed at.
+
+Directory discovery runs on each definition/reference query, stopping at the
+first matching regular file in each directory's alphabetical recursive
+traversal. It considers untracked and ignored files, deduplicates seed paths,
+and skips hidden entries, nested symlinks, and these dependency/build
+directories: `node_modules`, `deps`, `_build`, `target`, `dist`, `build`,
+`out`, and `vendor`. Repeated seed paths are opened only once.
+Missing directories and read errors encountered during discovery fail the query;
+empty directories are skipped. Positional queries also open the seeds before
+asking the server for definitions or references. `symbols FILE` remains a
+single-file operation.
 
 ## Language-server clients
 
@@ -73,9 +111,12 @@ the daemon log.
 
 Document state follows the disk: `sync/2` sends `didOpen` once and a full
 `didChange` only when content differs from what the server last saw.
-`await_quiet/2` waits, bounded, until the server reports no `$/progress` work
+`await_quiet/2` refreshes already-open documents, closes documents deleted from
+disk, and waits, bounded, until the server reports no `$/progress` work
 and a short settle period has passed — opening a file can start a whole
 project load, and answers given during one are confidently incomplete.
 
 Run `mix test` from this directory. `test/support/fake_lsp.exs` is a scripted
 stdio language server the client tests run over real pipes.
+The directory integration tests use `typescript-language-server` when it is
+on PATH; otherwise ExUnit skips them.

@@ -54,7 +54,8 @@ defmodule Symd.Lsp.Client do
 
   @doc """
   Waits, up to a bound, until the server looks idle: no active `$/progress`
-  work and a short settle period since the last document we sent it. Opening
+  work and a short settle period since the last document we sent it. Refreshes
+  already-open documents from disk and closes deleted ones. Opening
   a file can start a whole project load (tsserver does); answers given during
   it are confidently incomplete, which is worse than being slow.
   """
@@ -141,6 +142,7 @@ defmodule Symd.Lsp.Client do
   end
 
   def handle_call(:quiet?, _from, state) do
+    state = refresh_documents(state)
     since_activity = System.monotonic_time(:millisecond) - state.last_activity
     {:reply, MapSet.size(state.progress) == 0 and since_activity >= state.settle_ms, state}
   end
@@ -424,6 +426,26 @@ defmodule Symd.Lsp.Client do
   defp language_id(path) do
     extension = path |> Path.extname() |> String.downcase()
     Map.get(@language_ids, extension, String.trim_leading(extension, "."))
+  end
+
+  # The server trusts open buffers over disk, including files opened by older
+  # queries. Keep those current even when this query only syncs seed files.
+  defp refresh_documents(state) do
+    Enum.reduce(state.documents, state, fn {uri, _document}, state ->
+      {:ok, path} = Uri.to_path(uri)
+
+      case File.read(path) do
+        {:ok, content} ->
+          sync_document(state, path, content)
+
+        {:error, :enoent} ->
+          notify(state.port, "textDocument/didClose", %{"textDocument" => %{"uri" => uri}})
+          %{touch(state) | documents: Map.delete(state.documents, uri)}
+
+        {:error, _reason} ->
+          state
+      end
+    end)
   end
 
   defp send_message(port, message), do: Port.command(port, Wire.encode(message))

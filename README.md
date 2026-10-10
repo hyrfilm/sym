@@ -1,14 +1,23 @@
 # sym
 
-`sym` answers the questions coding agents usually mis-solve with grep: where
-is this defined, where is it referenced, what does this file declare. A small
-Go CLI talks to `symd`, an Elixir daemon that owns language-server processes
-and translates LSP into those answers.
+`sym` finds definitions, references, and the symbols declared in a file.
+It uses language servers to answer questions about code from the command
+line, with output that coding agents and scripts can read.
 
-`sym` points at language servers; it does not install or manage them. Where
-an executable comes from — nix, npm, a checkout — is your business.
+```sh
+sym def parse
+sym refs createMidiScheduler
+sym symbols src/parser.ts
+```
 
-## Run
+There are two parts: the `sym` command and `symd`, a daemon that runs in
+the background. The command sends each query to the daemon, which keeps
+language servers running between queries. The first query starts the
+daemon automatically.
+
+The [agent skill](skills/sym/SKILL.md) describes when and how to use sym.
+
+## Install
 
 Build and install the Nix package from a checkout:
 
@@ -17,130 +26,166 @@ nix build .
 nix profile add ./result
 ```
 
-The package supplies the Erlang runtime; language servers are yours to
-provide. Configure them once, globally, in `~/.config/sym/sym.toml`
-(see below) — then, from anywhere inside any git repository:
-
-```sh
-sym refs createMidiScheduler
-sym def parse
-sym def Parser.parse
-sym refs --at src/parser.ts:42:8
-sym symbols src/parser.ts
-```
-
-There is no setup step per repository and no daemon to start: the first
-query starts `symd` in the background, language servers start lazily on the
-first query that needs them (the first answer per server is the slow one),
-and everything shuts itself down when unused — each language server after
-15 idle minutes, the daemon after 30. `sym start`, `sym status`, and
-`sym stop` remain for explicit control; `status` lists the workspaces the
-daemon currently serves. After upgrading sym, a still-running older daemon
-is replaced automatically by the next query.
-
-## Workspaces
-
-Every query carries the directory it was run from. Walking upward from
-there, the first directory containing `sym.toml` or `.git` is the workspace
-root:
-
-- `sym.toml` wins when both are in the same directory, and marks the root
-  explicitly — this is also the monorepo escape hatch: a `sym.toml` in
-  `packages/web/` scopes queries under it to that package.
-- A `.git` root uses the global config, `~/.config/sym/sym.toml`
-  (`$XDG_CONFIG_HOME` is honored). The search never continues past a
-  repository boundary.
-- Neither found: the query fails with `no_workspace`.
-
-The nearest config wins wholesale; files are not merged. Source roots inside
-a project (`src/`, `tsconfig.json` directories, `go.mod` modules) are the
-language server's own business — sym hands it the workspace root and the
-server does its project discovery from there. Queries behave identically
-from any directory inside the project.
+Install the language servers you need separately, then add them to sym's
+configuration as described below.
 
 ## Configuration
 
-Each `[lsp.<name>]` table says how to start one language server and which
-files it answers for — the format is the same globally and per project:
+Use `~/.config/sym/sym.toml` for settings shared across Git repositories.
+To configure one project, put `sym.toml` at its root. A project config
+replaces the global config completely, so include all the servers it needs.
+If you use `XDG_CONFIG_HOME`, the global config goes in
+`$XDG_CONFIG_HOME/sym/sym.toml` instead.
+
+Each `[lsp.<name>]` section configures a language server. For example, to
+use TypeScript and Svelte:
 
 ```toml
 [lsp.typescript]
 command = "typescript-language-server"
 args = ["--stdio"]
 extensions = [".ts", ".tsx", ".js", ".jsx"]
+
+[lsp.svelte]
+command = "svelteserver"
+args = ["--stdio"]
+extensions = [".svelte"]
 ```
 
-`command` is an executable name looked up on PATH, or a path resolved
-against the config file's directory. Config edits are picked up on the next
-query — the affected root's language servers restart; no daemon restart is
-needed.
+| Setting | Meaning |
+| --- | --- |
+| `command` | The executable to run, found on `PATH` or at a path relative to the config file. |
+| `args` | Arguments passed to the executable. Defaults to `[]`. |
+| `extensions` | File extensions handled by this server, including the leading dot. |
+| `directories` | Optional source directories to open files from before queries. |
 
-One daemon serves all workspaces through one socket, `~/.sym/symd.sock` by
-default; its log (including language-server stderr) is `~/.sym/symd.sock.log`.
-`SYM_SOCKET` or the `--socket` flag (before the command) select a different
-socket — useful for isolated test runs.
+`command` and `extensions` are required. An extension such as `.ts` covers
+both `parser.ts` and `parser.test.ts`. See [examples/sym.toml](examples/sym.toml)
+for more server configurations.
 
-## Agents
+### Source directories
 
-[skills/sym/SKILL.md](skills/sym/SKILL.md) is a ready-made skill file. Copy
-it to `~/.claude/skills/sym/SKILL.md` (or a project's `.claude/skills/sym/`)
-so agents reach for `sym` instead of grep. It is deliberately free of setup
-instructions, because the tool needs none.
+If your project has more than one source directory, you can list the
+directories explicitly. Add this under the relevant `[lsp.<name>]` section:
 
-The Nix package also installs reference copies for declarative setups —
-`share/sym/SKILL.md` and an example global config at `share/sym/sym.toml`
-([examples/sym.toml](examples/sym.toml)) — so a home-manager or nix-darwin
-flake can link them into place instead of copying by hand.
+```toml
+directories = ["src", "test", "e2e"]
+```
 
-## Answers
+Before definition and reference queries, sym opens one matching file in
+each directory to help the language server load its projects. The server
+can also return results from other directories. Without this option, or
+with `directories = []`, name searches start from one file per server.
 
-The default output is one `path:line:col` per line — the shape every tool
-already parses — with a tab-separated `name (kind)` description where one
-exists. Lines and columns are 1-based; columns count codepoints. `--json`
-prints the result object instead, with absolute paths.
+Paths are relative to the project root, including when set in the global
+config. Use directory names without wildcards or `..`. Missing directories
+cause an error; directories with no matching files are skipped.
+
+Config changes take effect on the next query. sym restarts the affected
+project's language servers automatically.
+
+## Usage
+
+Run sym from anywhere inside a configured project or Git repository.
+Use a name to find definitions or references:
 
 ```sh
-$ sym refs createMidiScheduler
-src/foo.ts:17:5
-src/bar.ts:82:11
+sym def parse
+sym refs createMidiScheduler
 ```
 
-Names are search terms; locations are authoritative. A name query consults
-every configured server that has matching files in the workspace — a
-TypeScript repo never boots the Elixir server, however many servers the
-global config lists. A dotted name (`Parser.parse`) narrows by container. When a name matches several symbols,
-the reply groups references per symbol; past five matches it returns the
-candidate definitions instead and exits with status 3, so an agent knows to
-narrow with a qualified name or `--at FILE:LINE:COL` rather than parse refs.
-Exit codes: 0 answered, 1 failure, 2 bad usage, 3 too ambiguous.
+A qualified name such as `Parser.parse` narrows the matches. If you know
+where a symbol occurs, use its file, line, and column:
 
-Files are re-read from disk and re-sent to the server on every query, so
-answers reflect edits made since the last one. Definition and reference
-queries also wait (bounded) while a server reports indexing progress, because
-an answer computed during a project load is confidently incomplete.
-
-## CLI / service protocol
-
-[cli/](cli/README.md) parses arguments, sends one JSON request line over the
-Unix socket, formats the JSON reply, and exits. It also launches its
-companion daemon when none answers. [symd/](symd/README.md) owns workspace
-resolution, language-server processes, and the semantic operations. One
-request per connection; requests carry `op` (`symbols`, `def`, `refs`,
-`status`, `stop`) plus either `name` or `path`[+`line`+`column`], with
-absolute paths; semantic requests also carry the caller's absolute `cwd`:
-
-```json
-{"op":"refs","name":"createMidiScheduler","cwd":"/home/user/project"}
-{"ok":true,"result":{"matches":[{"symbol":{...},"refs":[{"path":"...","line":17,"column":5}]}]}}
+```sh
+sym def Parser.parse
+sym def --at src/parser.ts:42:8
+sym refs --at src/parser.ts:42:8
 ```
 
-Failures use `{"ok":false,"error":{"code":"...","message":"..."}}` and make
-the CLI exit with status 1. Daemon `status` returns `service: "symd"`,
-`protocol: 3`, `state: "running"`, its process ID, and the `workspaces` it
-has resolved; `stop` acknowledges `state: "stopping"` and the CLI waits for
-socket cleanup.
+To list the symbols declared in one file, use `sym symbols src/parser.ts`.
+Lines and columns start at 1. Columns count Unicode codepoints.
 
-## Develop
+Results use `path:line:column`, with a name and kind when available.
+Paths are relative to the current directory when possible. For JSON output
+with absolute paths, put `--json` before the command:
+
+```sh
+sym --json refs createMidiScheduler
+```
+
+When a reference query matches several symbols, sym groups the results by
+symbol. With more than five matches, it prints the possible definitions
+instead. Use a qualified name or `--at` to narrow the query. Exit codes are
+0 for success, 1 for failure, 2 for incorrect usage, and 3 for too many matches.
+
+### Managing the daemon
+
+The daemon starts automatically, but you can also control it directly:
+
+```sh
+sym start
+sym status
+sym stop
+```
+
+`status` lists the projects the daemon is serving. After upgrading or
+rebuilding sym, run `sym stop`; the next query starts the new daemon.
+
+The default socket is `~/.sym/symd.sock`, and the log is
+`~/.sym/symd.sock.log`. Set `SYM_SOCKET` or pass `--socket` before the command
+to use a different socket. Its log has the same path with `.log` appended.
+More options are described in the [CLI documentation](cli/README.md).
+
+## How it works
+
+The daemon starts language servers as they are needed and reuses them for
+later queries. Each workspace has its own server processes. The first query
+takes longer because the server has to load the code; later queries use
+what it has already loaded.
+
+A language server stops after 15 idle minutes. The daemon stops after
+30 idle minutes.
+
+### Finding the project root
+
+Starting from the current directory, sym walks upward until it finds
+`sym.toml` or `.git`. That directory is the project root, also called the
+workspace. sym uses the config there, or the global config if it finds only
+`.git`. It never looks beyond a Git repository's root.
+
+This also lets you configure packages separately. For example, placing
+`sym.toml` in `packages/web/` makes that directory a workspace of its own
+when you run sym from there or one of its subdirectories. Projects outside
+Git need a `sym.toml` to mark their root.
+
+### Loading files
+
+Language servers use compiler settings and imports to decide which files
+belong together. Opening one file can load a whole project. The `directories`
+setting gives the server a file to start from in each listed directory.
+If a directory contains several independent projects, list their directories
+individually.
+
+TypeScript Language Server can limit name searches to the projects
+containing the last file it accessed. If an app and its build scripts have
+separate configurations and share no files, a name search may cover only
+one of them. Using `--at` skips the name lookup; `symbols FILE` queries
+that file directly.
+
+### Reading changes
+
+sym reads files from disk and sends changed contents to the language server.
+Before definition and reference queries, it also refreshes files opened by
+earlier queries, closes deleted files, and waits briefly while the server
+reports loading work. The server handles changes to files sym has not opened.
+Save editor changes before querying them with sym.
+
+## Development
+
+The CLI is written in Go and the daemon in Elixir. The
+[CLI documentation](cli/README.md) and [daemon documentation](symd/README.md)
+explain their implementation and the protocol between them.
 
 ```sh
 nix develop
@@ -148,12 +193,12 @@ just build
 just check
 ```
 
-With direnv active, skip `nix develop`. `just build` fetches Mix dependencies
-and builds the development executables into `bin/`; that development `symd`
-still uses the shell's Erlang runtime. `just check` runs tests, formatting
-checks, and Go vet. `just package` builds the local Nix package into
-`result/`, and `just test-package` checks it with a bare runtime PATH,
-including crash recovery.
+With direnv active, skip `nix develop`. `just build` fetches dependencies
+and writes the development executables to `bin/`. The development daemon
+uses the shell's Erlang runtime. `just check` runs the tests, formatting
+checks, and Go vet.
 
-Before new source files are tracked by Git, use `just package path:.` with the
-daemon stopped; that copies the local directory instead of Git's tracked files.
+`just package` builds the Nix package into `result/`. `just test-package`
+checks the packaged CLI and daemon, including startup and crash recovery.
+To include source files not yet tracked by Git, stop the daemon and use
+`just package path:.`.

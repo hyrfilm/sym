@@ -3,7 +3,7 @@
 The Go CLI uses only the standard library. It parses arguments, sends one
 request to `symd`, formats the reply, and exits. It does not speak LSP, know
 languages, resolve symbol ambiguity, or keep state. The
-[Nix package](../README.md#run) puts its companion `symd` alongside it.
+[Nix package](../README.md#install) puts its companion `symd` alongside it.
 
 From anywhere inside a workspace (a directory with `sym.toml`, or a git
 repository covered by the global config):

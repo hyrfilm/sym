@@ -514,4 +514,101 @@ defmodule Symd.SemanticTest do
     assert_received {:seeded, seeded}
     assert seeded == Path.join(dir, "vite.config.ts")
   end
+
+  @tag :tmp_dir
+  test "configured directories seed one file each for positional and name queries", %{
+    tmp_dir: dir
+  } do
+    files = ["src/app.ts", "src/nested/helper.TS", "test/nested/app.test.ts"]
+
+    for file <-
+          files ++
+            [
+              "other/ignored.ts",
+              "src/readme.md",
+              "src/zzz.ts",
+              "src/nested/zzz.ts",
+              "test/z.ts",
+              "src/node_modules/dependency.ts",
+              "test/node_modules/dependency.ts",
+              "src/.cache/a.ts"
+            ] do
+      path = Path.join(dir, file)
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, "")
+    end
+
+    File.ln_s!(Path.join(dir, "src"), Path.join(dir, "src/00-cycle"))
+    File.ln_s!(Path.join(dir, "other/ignored.ts"), Path.join(dir, "src/01-link.ts"))
+    lsp = Map.put(@typescript, :directories, ["src/", "test/", "src/nested", "test/nested"])
+    parent = self()
+    expected = MapSet.new(files, &Path.join(dir, &1))
+
+    workspace =
+      workspace(
+        root: dir,
+        lsps: [lsp],
+        sync: fn ^lsp, path ->
+          assert path in expected
+          send(parent, {:loaded, path})
+          File.read(path)
+        end,
+        request: fn ^lsp, method, _params ->
+          assert method in ["textDocument/references", "workspace/symbol"]
+          for path <- expected, do: assert_received({:loaded, ^path})
+          {:ok, []}
+        end
+      )
+
+    assert {:ok, _} =
+             Semantic.references(workspace, %{
+               path: Path.join(dir, "src/app.ts"),
+               line: 1,
+               column: 1
+             })
+
+    # The explicit query target is also synced; overlapping seeds are not.
+    target = Path.join(dir, "src/app.ts")
+    assert_received {:loaded, ^target}
+    refute_received {:loaded, _}
+
+    assert {:error, {:symbol_not_found, "Missing", _}} =
+             Semantic.definition(workspace, "Missing")
+
+    refute_received {:loaded, _}
+
+    # If the representative disappears, select the next matching file.
+    File.rm!(Path.join(dir, "test/nested/app.test.ts"))
+    fallback = Path.join(dir, "test/z.ts")
+    lsp = %{lsp | directories: ["test/"]}
+
+    workspace = %{
+      workspace
+      | lsps: [lsp],
+        sync: fn ^lsp, ^fallback -> {:ok, ""} end,
+        request: fn ^lsp, "workspace/symbol", _ -> {:ok, []} end
+    }
+
+    assert {:error, {:symbol_not_found, "Missing", _}} =
+             Semantic.definition(workspace, "Missing")
+  end
+
+  @tag :tmp_dir
+  test "a missing configured directory is an error, not a partial search", %{tmp_dir: dir} do
+    lsp = Map.put(@typescript, :directories, ["missing"])
+    path = Path.join(dir, "missing")
+
+    assert {:error, {:lsp_failed, "typescript", {:file_read, ^path, :enoent}}} =
+             Semantic.definition(workspace(root: dir, lsps: [lsp]), "parse")
+  end
+
+  @tag :tmp_dir
+  test "configured directories without matching files do not start the server", %{tmp_dir: dir} do
+    File.mkdir_p!(Path.join(dir, "test"))
+    File.write!(Path.join(dir, "outside.ts"), "")
+    lsp = Map.put(@typescript, :directories, ["test"])
+
+    assert {:error, {:no_lsp_for_workspace, ^dir, _}} =
+             Semantic.definition(workspace(root: dir, lsps: [lsp]), "parse")
+  end
 end
