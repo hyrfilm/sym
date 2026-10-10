@@ -1,48 +1,30 @@
 defmodule Symd.Service do
   @moduledoc """
-  Connects client requests to the workspace's semantic operations.
+  Connects client requests to a workspace's semantic operations.
 
-  Startup turns the config file into a `Symd.Workspace`. After that, every
-  connection sends its request here. Requests are validated strictly — a
-  misspelled or extra field is an error, not something to guess about — and
-  every reply is an envelope the CLI can print without knowing the operation.
-  Control results are tagged so the transport can act on them.
+  Every semantic request carries the caller's working directory, and
+  `Symd.Workspaces` turns that into the workspace the query runs against —
+  one daemon serves any number of projects. Requests are validated strictly:
+  a misspelled or extra field is an error, not something to guess about, and
+  every reply is an envelope the CLI can print without knowing the
+  operation. Control results are tagged so the transport can act on them.
   """
 
-  alias Symd.{Config, Semantic, Workspace}
+  alias Symd.{Semantic, Workspaces}
 
-  @protocol 2
-
-  @doc """
-  Reads the config and builds the workspace. The workspace root is the
-  config file's directory, and config-relative commands become absolute so
-  they mean the same thing no matter where the daemon was started from.
-  No language server is touched here; they start on first use.
-  """
-  def open(config_path) do
-    with {:ok, toml} <- File.read(config_path),
-         {:ok, lsps} <- Config.parse(toml) do
-      root = Path.dirname(Path.expand(config_path))
-
-      lsps =
-        Enum.map(lsps, fn lsp ->
-          if String.contains?(lsp.command, "/"),
-            do: %{lsp | command: Path.expand(lsp.command, root)},
-            else: lsp
-        end)
-
-      {:ok, Workspace.new(root, lsps)}
-    end
-  end
+  @protocol 3
 
   @doc """
   Decodes a request and passes it to `handle/2`. Bad JSON becomes an error
   reply so it only spoils that request. Transport owns framing and size
   limits; this function deals with the contents of a request.
+
+  `deps` exists for tests: `:fetch` resolves a cwd to a workspace and
+  `:list` names the known workspaces. Both default to `Symd.Workspaces`.
   """
-  def request(workspace, json) do
+  def request(json, deps \\ []) do
     case JSON.decode(json) do
-      {:ok, request} -> handle(workspace, request)
+      {:ok, request} -> handle(request, deps)
       {:error, _reason} -> error("invalid_request", "expected a JSON request")
     end
   end
@@ -53,38 +35,43 @@ defmodule Symd.Service do
   change what a request does. Locations are 1-based `line`/`column` in
   codepoints; the semantic layer owns the LSP coordinate conversion.
   """
-  def handle(workspace, %{"op" => "symbols", "path" => path} = request)
-      when map_size(request) == 2 and is_binary(path) and byte_size(path) > 0 do
-    reply(Semantic.symbols(workspace, path))
+  def handle(request, deps \\ [])
+
+  def handle(%{"op" => "symbols", "path" => path, "cwd" => cwd} = request, deps)
+      when map_size(request) == 3 and is_binary(path) and byte_size(path) > 0 do
+    semantic(deps, cwd, &Semantic.symbols(&1, path))
   end
 
-  def handle(workspace, %{"op" => op, "name" => name} = request)
-      when op in ["def", "refs"] and map_size(request) == 2 and is_binary(name) and
+  def handle(%{"op" => op, "name" => name, "cwd" => cwd} = request, deps)
+      when op in ["def", "refs"] and map_size(request) == 3 and is_binary(name) and
              byte_size(name) > 0 do
     case op do
-      "def" -> reply(Semantic.definition(workspace, name))
-      "refs" -> reply(Semantic.references(workspace, name))
+      "def" -> semantic(deps, cwd, &Semantic.definition(&1, name))
+      "refs" -> semantic(deps, cwd, &Semantic.references(&1, name))
     end
   end
 
   def handle(
-        workspace,
-        %{"op" => op, "path" => path, "line" => line, "column" => column} = request
+        %{"op" => op, "path" => path, "line" => line, "column" => column, "cwd" => cwd} =
+          request,
+        deps
       )
-      when op in ["def", "refs"] and map_size(request) == 4 and is_binary(path) and
+      when op in ["def", "refs"] and map_size(request) == 5 and is_binary(path) and
              byte_size(path) > 0 and is_integer(line) and line >= 1 and is_integer(column) and
              column >= 1 do
     at = %{path: path, line: line, column: column}
 
     case op do
-      "def" -> reply(Semantic.definition(workspace, at))
-      "refs" -> reply(Semantic.references(workspace, at))
+      "def" -> semantic(deps, cwd, &Semantic.definition(&1, at))
+      "refs" -> semantic(deps, cwd, &Semantic.references(&1, at))
     end
   end
 
   # Management messages use the same socket as semantic requests. The
   # protocol number lets the launcher verify that it found a compatible symd.
-  def handle(_workspace, %{"op" => "status"} = request) when map_size(request) == 1 do
+  def handle(%{"op" => "status"} = request, deps) when map_size(request) == 1 do
+    list = Keyword.get(deps, :list, &Workspaces.list/0)
+
     {:daemon, :status,
      %{
        "ok" => true,
@@ -92,12 +79,13 @@ defmodule Symd.Service do
          "service" => "symd",
          "protocol" => @protocol,
          "state" => "running",
-         "pid" => System.pid()
+         "pid" => System.pid(),
+         "workspaces" => list.()
        }
      }}
   end
 
-  def handle(_workspace, %{"op" => "stop"} = request) when map_size(request) == 1 do
+  def handle(%{"op" => "stop"} = request, _deps) when map_size(request) == 1 do
     # A stop is an explicit control result. Transport sends the acknowledgement
     # before closing the listener, so the executable can unlink its own socket.
     {:daemon, :stop,
@@ -107,17 +95,37 @@ defmodule Symd.Service do
      }}
   end
 
-  def handle(_workspace, _request),
+  def handle(_request, _deps),
     do:
       error(
         "invalid_request",
-        "expected symbols with path, def/refs with name or with path+line+column, status, or stop"
+        "expected symbols with path, or def/refs with name or with path+line+column " <>
+          "(each with the caller's cwd), or status, or stop"
       )
+
+  # The caller's working directory picks the workspace, per request, so one
+  # daemon answers for every project and a config edit is seen immediately.
+  defp semantic(deps, cwd, operation) do
+    if is_binary(cwd) and Path.type(cwd) == :absolute do
+      fetch = Keyword.get(deps, :fetch, &Workspaces.fetch/1)
+
+      case fetch.(cwd) do
+        {:ok, workspace} -> reply(operation.(workspace))
+        {:error, reason} -> reply({:error, reason})
+      end
+    else
+      error("invalid_request", "cwd must be an absolute path")
+    end
+  end
 
   defp reply({:ok, result}), do: %{"ok" => true, "result" => result}
   defp reply({:error, reason}), do: error(code(reason), reason)
 
   # Stable codes for clients; the message is for the person reading it.
+  defp code({:no_workspace, _cwd}), do: "no_workspace"
+  defp code({:no_config, _root, _global}), do: "no_config"
+  defp code({:config_unreadable, _path, _posix}), do: "invalid_config"
+  defp code({:invalid_config, _path, _detail}), do: "invalid_config"
   defp code({:no_lsp_for_path, _path, _extensions}), do: "unsupported_file"
   defp code({:symbol_not_found, _name, _similar}), do: "symbol_not_found"
   defp code({:file_read, _path, _reason}), do: "file_unreadable"
@@ -143,6 +151,15 @@ defmodule Symd.Service do
   Explains failures returned by the semantic layer or transport. The
   executable uses the same messages for startup errors.
   """
+  def message({:no_workspace, cwd}),
+    do: "no workspace found from #{cwd}: no sym.toml or .git here or in any parent directory"
+
+  def message({:no_config, root, global}),
+    do: "#{root} has no sym.toml, and there is no global config at #{global}"
+
+  def message({:config_unreadable, path, posix}), do: "cannot read #{path}: #{message(posix)}"
+  def message({:invalid_config, path, detail}), do: "#{path}: #{detail}"
+
   def message({:no_lsp_for_path, path, []}),
     do: "no LSPs are configured; add an [lsp.<name>] table to sym.toml for #{path}"
 

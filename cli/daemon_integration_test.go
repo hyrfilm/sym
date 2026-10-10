@@ -24,23 +24,35 @@ func TestDaemonLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, err := os.MkdirTemp("/tmp", "sym-release-")
+	// The directory name keeps a space so path handling stays honest.
+	dir, err := os.MkdirTemp("/tmp", "sym release ")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	config := filepath.Join(dir, "config with spaces.toml")
+	project := filepath.Join(dir, "project")
+	nested := filepath.Join(project, "deeply", "nested")
+	if err := os.MkdirAll(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
 	toml := "[lsp.absent]\ncommand = 'definitely-not-installed-lsp'\nextensions = ['.zz']\n"
-	if err := os.WriteFile(config, []byte(toml), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(project, "sym.toml"), []byte(toml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// No sym.toml and no .git anywhere above it.
+	outside := filepath.Join(dir, "outside")
+	if err := os.MkdirAll(outside, 0700); err != nil {
 		t.Fatal(err)
 	}
 	socket := filepath.Join(dir, "run", "symd.sock")
 	t.Setenv("PATH", "/usr/bin:/bin")
-	invoke := func(args ...string) (response, string, error) {
+	// Keep the daemon's global-config lookup away from the developer's real one.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg"))
+	invoke := func(cwd string, args ...string) (response, string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		command := exec.CommandContext(ctx, binary, append([]string{"--config", config, "--socket", socket}, args...)...)
-		command.Dir = "/"
+		command := exec.CommandContext(ctx, binary, append([]string{"--socket", socket}, args...)...)
+		command.Dir = cwd
 		var stdout, stderr bytes.Buffer
 		command.Stdout, command.Stderr = &stdout, &stderr
 		err := command.Run()
@@ -51,10 +63,10 @@ func TestDaemonLifecycle(t *testing.T) {
 		return reply, stderr.String(), err
 	}
 	// Stop only our uniquely addressed daemon, even when an assertion fails.
-	t.Cleanup(func() { _, _, _ = invoke("stop") })
+	t.Cleanup(func() { _, _, _ = invoke(project, "stop") })
 	state := func(command, expected string) string {
 		t.Helper()
-		reply, stderr, err := invoke(command)
+		reply, stderr, err := invoke(project, command)
 		if err != nil {
 			t.Fatalf("%s: %v: %s", command, err, stderr)
 		}
@@ -74,22 +86,34 @@ func TestDaemonLifecycle(t *testing.T) {
 		t.Fatal("repeated start replaced the running daemon")
 	}
 	state("status", "running")
-	// Semantic requests reach the daemon's dispatch: an extension nothing is
-	// configured for is refused, and a name query that needs the configured
-	// server reports the missing executable instead of hanging or crashing.
-	if _, stderr, err := invoke("symbols", filepath.Join(dir, "readme.txt")); err == nil ||
+	// Queries carry their cwd: from a nested directory the daemon resolves
+	// the project root above it. An extension nothing is configured for is
+	// refused, and a name query that needs the configured server reports the
+	// missing executable instead of hanging or crashing.
+	if _, stderr, err := invoke(nested, "symbols", filepath.Join(project, "readme.txt")); err == nil ||
 		!strings.Contains(stderr, "unsupported_file") {
 		t.Fatalf("expected an unsupported_file refusal: %v: %s", err, stderr)
 	}
-	if _, stderr, err := invoke("refs", "anything"); err == nil ||
+	if _, stderr, err := invoke(nested, "refs", "anything"); err == nil ||
 		!strings.Contains(stderr, "lsp_unavailable") {
 		t.Fatalf("expected an lsp_unavailable failure: %v: %s", err, stderr)
+	}
+	// Outside any workspace there is nothing to resolve against.
+	if _, stderr, err := invoke(outside, "refs", "anything"); err == nil ||
+		!strings.Contains(stderr, "no_workspace") {
+		t.Fatalf("expected a no_workspace failure: %v: %s", err, stderr)
 	}
 	state("stop", "stopped")
 	if _, err := os.Lstat(socket); !os.IsNotExist(err) {
 		t.Fatalf("stop left the socket behind: %v", err)
 	}
-	state("start", "running")
+
+	// With no daemon running, a query auto-starts one and still answers.
+	if _, stderr, err := invoke(nested, "refs", "anything"); err == nil ||
+		!strings.Contains(stderr, "lsp_unavailable") {
+		t.Fatalf("expected auto-start and an lsp_unavailable failure: %v: %s", err, stderr)
+	}
+	state("status", "running")
 	state("stop", "stopped")
 
 	// A crash leaves the file but releases the listener. The next start should
@@ -107,7 +131,7 @@ func TestDaemonLifecycle(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		reply, _, err := invoke("status")
+		reply, _, err := invoke(project, "status")
 		if err == nil && !isRunning(reply) {
 			break
 		}
@@ -122,14 +146,6 @@ func TestDaemonLifecycle(t *testing.T) {
 	state("start", "running")
 	state("stop", "stopped")
 
-	// Failed startup must reach the caller, with the config path and the actual
-	// explanation, instead of looking like a successful background launch.
-	missingConfig := filepath.Join(dir, "missing.toml")
-	if _, stderr, err := invoke("--config", missingConfig, "start"); err == nil || !strings.Contains(stderr, missingConfig) {
-		t.Fatalf("missing config did not produce a useful startup error: %v: %s", err, stderr)
-	}
-	state("status", "stopped")
-
 	// Concurrent starts must converge on one verified instance. Neither losing
 	// launcher may leave a candidate around to appear after a later stop.
 	type startResult struct {
@@ -140,7 +156,7 @@ func TestDaemonLifecycle(t *testing.T) {
 	starts := make(chan startResult, 2)
 	for range 2 {
 		go func() {
-			reply, stderr, err := invoke("start")
+			reply, stderr, err := invoke(project, "start")
 			starts <- startResult{reply, stderr, err}
 		}()
 	}

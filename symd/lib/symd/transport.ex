@@ -9,7 +9,7 @@ defmodule Symd.Transport do
   own protocol, separate from the LSP framing the daemon speaks to servers.
   """
 
-  alias Symd.Service
+  alias Symd.{Idle, Service}
   @max_line 65_536
 
   @doc """
@@ -103,13 +103,16 @@ defmodule Symd.Transport do
   @doc """
   Accepts connections until the listener closes and hands each one to a task
   under `supervisor`. A stop request closes the listener from its handler,
-  which ends this loop; requests still in flight die with the VM.
+  which ends this loop; requests still in flight die with the VM. Every
+  accepted connection counts as activity for the idle watchdog. `handle` is
+  the request handler — injected so tests can serve canned services.
   """
-  def serve(workspace, listener, supervisor) do
+  def serve(listener, supervisor, handle \\ &Service.request/1) do
     case :gen_tcp.accept(listener) do
       {:ok, socket} ->
-        hand_off(workspace, socket, listener, supervisor)
-        serve(workspace, listener, supervisor)
+        Idle.touch()
+        hand_off(socket, listener, supervisor, handle)
+        serve(listener, supervisor, handle)
 
       {:error, :closed} ->
         :ok
@@ -119,13 +122,13 @@ defmodule Symd.Transport do
     end
   end
 
-  defp hand_off(workspace, socket, listener, supervisor) do
+  defp hand_off(socket, listener, supervisor, handle) do
     # The task may only touch the socket once it owns it, so it waits for the
     # ownership transfer to complete before reading.
     {:ok, task} =
       Task.Supervisor.start_child(supervisor, fn ->
         receive do
-          {:handle, owned} -> handle_connection(workspace, owned, listener)
+          {:handle, owned} -> handle_connection(owned, listener, handle)
         after
           5_000 -> :ok
         end
@@ -137,12 +140,12 @@ defmodule Symd.Transport do
     end
   end
 
-  defp handle_connection(workspace, socket, listener) do
+  defp handle_connection(socket, listener, handle) do
     # A client gets five seconds to send its line; answering it may take as
     # long as the language servers need.
     response =
       case :gen_tcp.recv(socket, 0, 5_000) do
-        {:ok, line} -> Service.request(workspace, line)
+        {:ok, line} -> handle.(line)
         {:error, reason} -> Service.error("invalid_request", reason)
       end
 

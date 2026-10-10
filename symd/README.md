@@ -1,12 +1,11 @@
 # symd service
 
 The Elixir service owns language-server processes and answers semantic
-queries over a Unix socket. From the repository root, follow the
-[package instructions](../README.md#run), then use `sym start` and `sym stop`
-to manage it. To run the packaged service in the foreground:
+queries over a Unix socket. It is normally started by the first `sym` query
+(or `sym start`); to run the packaged service in the foreground:
 
 ```sh
-./result/bin/symd --config sym.toml
+./result/bin/symd --socket /tmp/symd.sock
 ```
 
 ## Transport / service
@@ -17,23 +16,32 @@ one JSON line each way, one request per connection, request lines limited to
 query — a language server starting cold can take seconds — never blocks the
 next client, and a crash spoils one connection only. A stop request closes
 the listener from its handler, which ends the accept loop and lets the
-executable unlink its own socket. Startup recovers a refused stale socket
-after checking its identity, with one retry; it preserves live listeners and
-other kinds of files. This assumes a directory controlled by the user.
+executable unlink its own socket; `Symd.Idle` closes it the same way after
+30 minutes without connections, waiting until nothing is in flight. Startup
+recovers a refused stale socket after checking its identity, with one retry;
+it preserves live listeners and other kinds of files. This assumes a
+directory controlled by the user.
 
 `Symd.Service` validates requests strictly — missing or extra fields are
 errors, not guesses — dispatches `symbols`, `def`, and `refs` to the semantic
 layer, and produces result/error envelopes with stable error codes. Status
 and stop are tagged control results handled by the transport.
 
-## Configuration / workspace
+## Workspaces / configuration
+
+No configuration is read at startup. Every semantic request carries the
+caller's working directory; `Symd.Discovery` walks up from it, and the first
+directory containing `sym.toml` or `.git` is the workspace root (`sym.toml`
+wins in the same directory, and the search never crosses a repository
+boundary). A git root reads the global config, `$XDG_CONFIG_HOME/sym/sym.toml`.
 
 `Symd.Config.parse/1` reads the `[lsp.<name>]` tables: `command`, optional
-`args`, and the `extensions` the server answers for. `Symd.Service.open/1`
-resolves config-relative commands against the config file's directory — the
-workspace root — and builds a `Symd.Workspace`, whose `request`, `sync`, and
-`settle` functions are injected so the semantic layer tests against canned
-LSP replies. No language server is touched at startup.
+`args`, and the `extensions` the server answers for. `Symd.Workspaces`
+caches one `Symd.Workspace` per root, re-reading the config on every request
+and rebuilding — stopping the root's language servers first — when its
+content changes. Config-relative commands resolve against the config file's
+directory. The workspace's `request`, `sync`, and `settle` functions are
+injected, so the semantic layer tests against canned LSP replies.
 
 ## Semantic layer
 
@@ -52,12 +60,14 @@ guessed at.
 `Symd.Lsp.Client` owns one server process per configured LSP and workspace
 root, started lazily by `Symd.Servers` on the first query that needs it and
 registered under `{lsp name, root}`. Clients are temporary children: a dead
-server disappears with its client and the next query starts a fresh one. The
-client speaks JSON-RPC over stdio using `Content-Length` framing
-(`Symd.Lsp.Wire`), performs the initialize handshake during init, correlates
-requests by id without blocking in callbacks, and answers server-to-client
-requests with well-formed empty results. Server stderr is inherited by the VM
-and lands in the daemon log.
+server disappears with its client and the next query starts a fresh one, and
+a client that nobody queries for 15 minutes stops itself — with a best-effort
+LSP shutdown/exit goodbye — to release the server's memory. The client speaks
+JSON-RPC over stdio using `Content-Length` framing (`Symd.Lsp.Wire`),
+performs the initialize handshake during init, correlates requests by id
+without blocking in callbacks, and answers server-to-client requests with
+well-formed empty results. Server stderr is inherited by the VM and lands in
+the daemon log.
 
 Document state follows the disk: `sync/2` sends `didOpen` once and a full
 `didChange` only when content differs from what the server last saw.

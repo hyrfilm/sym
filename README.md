@@ -18,28 +18,50 @@ nix profile add ./result
 ```
 
 The package supplies the Erlang runtime; language servers are yours to
-provide. From a directory containing `sym.toml` (this repository includes one):
+provide. Configure them once, globally, in `~/.config/sym/sym.toml`
+(see below) — then, from anywhere inside any git repository:
 
 ```sh
-sym start
 sym refs createMidiScheduler
 sym def parse
 sym def Parser.parse
 sym refs --at src/parser.ts:42:8
 sym symbols src/parser.ts
-sym stop
 ```
 
-`start` launches `symd` in the background and waits until it is ready;
-repeating it keeps the existing daemon. `stop` shuts down and removes the
-socket. A later start recovers a socket left behind by a crash, while
-preserving live listeners. Language servers start lazily on the first query
-that needs them, so the first answer per server is the slow one.
+There is no setup step per repository and no daemon to start: the first
+query starts `symd` in the background, language servers start lazily on the
+first query that needs them (the first answer per server is the slow one),
+and everything shuts itself down when unused — each language server after
+15 idle minutes, the daemon after 30. `sym start`, `sym status`, and
+`sym stop` remain for explicit control; `status` lists the workspaces the
+daemon currently serves. After upgrading sym, a still-running older daemon
+is replaced automatically by the next query.
+
+## Workspaces
+
+Every query carries the directory it was run from. Walking upward from
+there, the first directory containing `sym.toml` or `.git` is the workspace
+root:
+
+- `sym.toml` wins when both are in the same directory, and marks the root
+  explicitly — this is also the monorepo escape hatch: a `sym.toml` in
+  `packages/web/` scopes queries under it to that package.
+- A `.git` root uses the global config, `~/.config/sym/sym.toml`
+  (`$XDG_CONFIG_HOME` is honored). The search never continues past a
+  repository boundary.
+- Neither found: the query fails with `no_workspace`.
+
+The nearest config wins wholesale; files are not merged. Source roots inside
+a project (`src/`, `tsconfig.json` directories, `go.mod` modules) are the
+language server's own business — sym hands it the workspace root and the
+server does its project discovery from there. Queries behave identically
+from any directory inside the project.
 
 ## Configuration
 
-Each `[lsp.<name>]` table in `sym.toml` says how to start one language server
-and which files it answers for:
+Each `[lsp.<name>]` table says how to start one language server and which
+files it answers for — the format is the same globally and per project:
 
 ```toml
 [lsp.typescript]
@@ -48,13 +70,22 @@ args = ["--stdio"]
 extensions = [".ts", ".tsx", ".js", ".jsx"]
 ```
 
-`command` is an executable name looked up on PATH, or a path resolved against
-the config file's directory. The workspace root is the config file's
-directory. The default socket is `.sym/symd.sock`, relative to the working
-directory, and logs (including language-server stderr) go to
-`.sym/symd.sock.log`. To share a daemon across directories, pass the same
-absolute `--socket` path to all commands and an absolute `--config` path to
-`start`. Global flags go before the command.
+`command` is an executable name looked up on PATH, or a path resolved
+against the config file's directory. Config edits are picked up on the next
+query — the affected root's language servers restart; no daemon restart is
+needed.
+
+One daemon serves all workspaces through one socket, `~/.sym/symd.sock` by
+default; its log (including language-server stderr) is `~/.sym/symd.sock.log`.
+`SYM_SOCKET` or the `--socket` flag (before the command) select a different
+socket — useful for isolated test runs.
+
+## Agents
+
+[skills/sym/SKILL.md](skills/sym/SKILL.md) is a ready-made skill file. Copy
+it to `~/.claude/skills/sym/SKILL.md` (or a project's `.claude/skills/sym/`)
+so agents reach for `sym` instead of grep. It is deliberately free of setup
+instructions, because the tool needs none.
 
 ## Answers
 
@@ -85,20 +116,22 @@ an answer computed during a project load is confidently incomplete.
 
 [cli/](cli/README.md) parses arguments, sends one JSON request line over the
 Unix socket, formats the JSON reply, and exits. It also launches its
-companion daemon on `start`. [symd/](symd/README.md) owns configuration,
-language-server processes, and the semantic operations. One request per
-connection; requests carry `op` (`symbols`, `def`, `refs`, `status`, `stop`)
-plus either `name` or `path`[+`line`+`column`], with absolute paths:
+companion daemon when none answers. [symd/](symd/README.md) owns workspace
+resolution, language-server processes, and the semantic operations. One
+request per connection; requests carry `op` (`symbols`, `def`, `refs`,
+`status`, `stop`) plus either `name` or `path`[+`line`+`column`], with
+absolute paths; semantic requests also carry the caller's absolute `cwd`:
 
 ```json
-{"op":"refs","name":"createMidiScheduler"}
+{"op":"refs","name":"createMidiScheduler","cwd":"/home/user/project"}
 {"ok":true,"result":{"matches":[{"symbol":{...},"refs":[{"path":"...","line":17,"column":5}]}]}}
 ```
 
 Failures use `{"ok":false,"error":{"code":"...","message":"..."}}` and make
 the CLI exit with status 1. Daemon `status` returns `service: "symd"`,
-`protocol: 2`, `state: "running"`, and its process ID inside the result;
-`stop` acknowledges `state: "stopping"` and the CLI waits for socket cleanup.
+`protocol: 3`, `state: "running"`, its process ID, and the `workspaces` it
+has resolved; `stop` acknowledges `state: "stopping"` and the CLI waits for
+socket cleanup.
 
 ## Develop
 

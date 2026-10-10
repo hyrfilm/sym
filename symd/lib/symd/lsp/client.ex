@@ -12,6 +12,10 @@ defmodule Symd.Lsp.Client do
   or a full didChange when the content differs from what the server last saw,
   because agents edit files between queries without telling anyone. The
   server's stderr is inherited by the VM and ends up in the daemon log.
+
+  A client that nobody has queried for a while stops itself and releases its
+  server — that is where the memory lives. Clients are temporary children,
+  so the next query simply starts a fresh one and pays a cold start.
   """
 
   use GenServer
@@ -23,6 +27,7 @@ defmodule Symd.Lsp.Client do
   @sync_timeout 15_000
   @settle_ms 300
   @quiet_wait 15_000
+  @idle_after 15 * 60_000
 
   def start_link(opts) do
     case Keyword.fetch(opts, :name) do
@@ -84,9 +89,16 @@ defmodule Symd.Lsp.Client do
     root = Keyword.fetch!(opts, :root)
     args = Keyword.get(opts, :args, [])
 
+    # Trapping exits makes a supervisor shutdown run terminate/2, so the
+    # server always gets its goodbye.
+    Process.flag(:trap_exit, true)
+
     with {:ok, executable} <- resolve(command),
          {:ok, port} <- open_port(executable, args, root),
          {:ok, buffer} <- handshake(port, root) do
+      idle_after = Keyword.get(opts, :idle_after, @idle_after)
+      Process.send_after(self(), :idle_check, idle_after)
+
       {:ok,
        %{
          port: port,
@@ -96,7 +108,9 @@ defmodule Symd.Lsp.Client do
          documents: %{},
          progress: MapSet.new(),
          settle_ms: Keyword.get(opts, :settle_ms, @settle_ms),
-         last_activity: System.monotonic_time(:millisecond)
+         last_activity: System.monotonic_time(:millisecond),
+         idle_after: idle_after,
+         last_used: System.monotonic_time(:millisecond)
        }}
     else
       {:error, reason} -> {:stop, reason}
@@ -114,10 +128,12 @@ defmodule Symd.Lsp.Client do
       "params" => params
     })
 
-    {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, from)}}
+    {:noreply, %{used(state) | next_id: id + 1, pending: Map.put(state.pending, id, from)}}
   end
 
   def handle_call({:sync, path}, _from, state) do
+    state = used(state)
+
     case File.read(path) do
       {:ok, content} -> {:reply, {:ok, content}, sync_document(state, path, content)}
       {:error, reason} -> {:reply, {:error, {:file_read, path, reason}}, state}
@@ -138,7 +154,32 @@ defmodule Symd.Lsp.Client do
     {:stop, {:shutdown, {:server_exited, status}}, fail_pending(state, {:server_exited, status})}
   end
 
+  def handle_info(:idle_check, state) do
+    idle_for = System.monotonic_time(:millisecond) - state.last_used
+
+    if map_size(state.pending) == 0 and idle_for >= state.idle_after do
+      # Nobody asked anything for a while: release the server. The next
+      # query starts a fresh one, which costs a cold start, not an answer.
+      {:stop, {:shutdown, :idle}, state}
+    else
+      Process.send_after(self(), :idle_check, max(state.idle_after - idle_for, 100))
+      {:noreply, state}
+    end
+  end
+
   def handle_info(_other, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, state) do
+    # A polite goodbye: some servers linger on stdin EOF alone. Best-effort —
+    # the port may already be gone when the server died first.
+    send_message(state.port, %{"jsonrpc" => "2.0", "id" => state.next_id, "method" => "shutdown"})
+    send_message(state.port, %{"jsonrpc" => "2.0", "method" => "exit"})
+    Port.close(state.port)
+    :ok
+  catch
+    _kind, _reason -> :ok
+  end
 
   defp dispatch(state) do
     case Wire.decode(state.buffer) do
@@ -157,7 +198,7 @@ defmodule Symd.Lsp.Client do
   defp handle_message(state, %{"id" => id} = message) when not is_map_key(message, "method") do
     {from, pending} = Map.pop(state.pending, id)
     if from, do: GenServer.reply(from, result(message))
-    %{state | pending: pending}
+    %{used(state) | pending: pending}
   end
 
   defp handle_message(state, %{"id" => _, "method" => _} = server_request) do
@@ -179,6 +220,7 @@ defmodule Symd.Lsp.Client do
   defp handle_message(state, _notification), do: state
 
   defp touch(state), do: %{state | last_activity: System.monotonic_time(:millisecond)}
+  defp used(state), do: %{state | last_used: System.monotonic_time(:millisecond)}
 
   defp result(%{"error" => %{"code" => code, "message" => message}}),
     do: {:error, {:lsp_error, code, message}}

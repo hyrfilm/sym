@@ -70,6 +70,25 @@ defmodule Symd.Lsp.ClientTest do
   end
 
   @tag :tmp_dir
+  test "an unused client stops itself and releases its server", %{tmp_dir: dir} do
+    Process.flag(:trap_exit, true)
+    client = start_client(dir, idle_after: 150)
+
+    assert {:ok, %{"tag" => "hi"}} = Client.request(client, "test/echo", %{"tag" => "hi"})
+    assert_receive {:EXIT, ^client, {:shutdown, :idle}}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "idle shutdown never interrupts a request in flight", %{tmp_dir: dir} do
+    Process.flag(:trap_exit, true)
+    client = start_client(dir, idle_after: 100)
+
+    # The request takes several idle periods to answer; it must still arrive.
+    assert {:ok, %{"ms" => 600}} = Client.request(client, "test/delay", %{"ms" => 600})
+    assert_receive {:EXIT, ^client, {:shutdown, :idle}}, 2_000
+  end
+
+  @tag :tmp_dir
   test "a dying server fails the requests that were waiting on it", %{tmp_dir: dir} do
     Process.flag(:trap_exit, true)
     client = start_client(dir)

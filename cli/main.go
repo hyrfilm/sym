@@ -17,13 +17,15 @@ import (
 
 // request is the one JSON object we send to symd per invocation. A semantic
 // request carries either a name or a path (symbols), or a path+line+column
-// location; management requests carry just the op.
+// location, plus the caller's working directory — the daemon resolves the
+// workspace from it. Management requests carry just the op.
 type request struct {
 	Op     string `json:"op"`
 	Name   string `json:"name,omitempty"`
 	Path   string `json:"path,omitempty"`
 	Line   int    `json:"line,omitempty"`
 	Column int    `json:"column,omitempty"`
+	Cwd    string `json:"cwd,omitempty"`
 }
 
 // response mirrors symd's reply envelope: either ok=true with a result, or
@@ -49,8 +51,7 @@ func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 func run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("sym", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	socket := flags.String("socket", ".sym/symd.sock", "symd Unix socket")
-	config := flags.String("config", "sym.toml", "TOML file passed to symd on start")
+	socket := flags.String("socket", defaultSocket(), "symd Unix socket")
 	service := flags.String("service", siblingService(), "symd executable")
 	asJSON := flags.Bool("json", false, "print the raw result object instead of location lines")
 	flags.Usage = func() {
@@ -125,13 +126,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var err error
 	switch req.Op {
 	case "start":
-		reply, err = startDaemon(*service, *config, *socket)
+		reply, err = startDaemon(*service, *socket)
 	case "status":
 		reply, err = daemonStatus(*socket, time.Second)
 	case "stop":
 		reply, err = stopDaemon(*socket)
 	default:
-		reply, err = socketRequest(*socket, req)
+		// The caller's directory picks the workspace; the daemon walks up
+		// from it to the nearest sym.toml or repository root.
+		req.Cwd, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintf(stderr, "sym: %v\n", err)
+			return 1
+		}
+		reply, err = semanticRequest(*service, *socket, req)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "sym: %v\n", err)
@@ -182,6 +190,21 @@ func parseLocation(location string) (string, int, int, error) {
 	return path, line, column, nil
 }
 
+// defaultSocket is one well-known, short path per user, the same from every
+// directory: queries find the same daemon wherever they run, and macOS's
+// ~104-byte socket path limit stays out of reach of deep project trees.
+// SYM_SOCKET overrides it for scripts; --socket overrides both.
+func defaultSocket() string {
+	if path := os.Getenv("SYM_SOCKET"); path != "" {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "symd.sock")
+	}
+	return filepath.Join(home, ".sym", "symd.sock")
+}
+
 // siblingService points -service at a symd binary sitting next to sym itself,
 // which is where `just build` puts both. If we can't find our own path, fall
 // back to plain "symd" so the shell's PATH lookup takes over.
@@ -200,7 +223,7 @@ func siblingService() string {
 func socketRequest(path string, req request) (response, error) {
 	reply, err := socketRequestWithin(path, req, 0)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
-		return response{}, fmt.Errorf("symd is not running at %s; run sym start with the same --socket setting", path)
+		return response{}, fmt.Errorf("symd is not running at %s", path)
 	}
 	return reply, err
 }

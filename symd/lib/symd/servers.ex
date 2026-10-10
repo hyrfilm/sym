@@ -15,8 +15,25 @@ defmodule Symd.Servers do
 
   @doc "Starts the registry and supervisor the clients live under."
   def start_runtime do
-    {:ok, _registry} = Registry.start_link(keys: :unique, name: @registry)
-    {:ok, _supervisor} = DynamicSupervisor.start_link(name: @supervisor, strategy: :one_for_one)
+    :ok = ensure(Registry.start_link(keys: :unique, name: @registry))
+    :ok = ensure(DynamicSupervisor.start_link(name: @supervisor, strategy: :one_for_one))
+    :ok
+  end
+
+  defp ensure({:ok, _pid}), do: :ok
+  defp ensure({:error, {:already_started, _pid}}), do: :ok
+
+  @doc """
+  Stops every running client under `root`. `Symd.Workspaces` calls this when
+  a root's configuration changes, so no server keeps answering through a
+  command or arguments the config no longer names.
+  """
+  def stop_root(root) do
+    for pid <-
+          Registry.select(@registry, [{{{:_, :"$1"}, :"$2", :_}, [{:==, :"$1", root}], [:"$2"]}]) do
+      DynamicSupervisor.terminate_child(@supervisor, pid)
+    end
+
     :ok
   end
 

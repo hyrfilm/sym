@@ -1,7 +1,7 @@
 defmodule Symd.TransportTest do
   use ExUnit.Case, async: true
 
-  alias Symd.{Transport, Workspace}
+  alias Symd.{Service, Transport, Workspace}
 
   @slow_lsp %{name: "slow", command: "x", args: [], extensions: [".slow"]}
 
@@ -15,6 +15,16 @@ defmodule Symd.TransportTest do
       },
       overrides
     )
+  end
+
+  # The real daemon serves &Service.request/1; tests wire the same service to
+  # a stub workspace instead of the global workspace cache.
+  defp handler(overrides) do
+    workspace = workspace(overrides)
+
+    fn line ->
+      Service.request(line, fetch: fn _cwd -> {:ok, workspace} end, list: fn -> [] end)
+    end
   end
 
   # Keep Unix socket paths below macOS's length limit, even when TMPDIR is long.
@@ -48,7 +58,7 @@ defmodule Symd.TransportTest do
     {:ok, supervisor} = Task.Supervisor.start_link([])
 
     assert {:ok, listener} = Transport.listen(path)
-    server = Task.async(fn -> Transport.serve(workspace([]), listener, supervisor) end)
+    server = Task.async(fn -> Transport.serve(listener, supervisor, handler([])) end)
     assert {:error, _taken} = Transport.listen(path)
     assert File.exists?(path)
 
@@ -66,8 +76,8 @@ defmodule Symd.TransportTest do
     {:ok, supervisor} = Task.Supervisor.start_link([])
     parent = self()
 
-    workspace =
-      workspace(
+    handler =
+      handler(
         request: fn @slow_lsp, "textDocument/documentSymbol", _params ->
           send(parent, {:blocked, self()})
 
@@ -78,17 +88,17 @@ defmodule Symd.TransportTest do
       )
 
     {:ok, listener} = Transport.listen(path)
-    server = Task.async(fn -> Transport.serve(workspace, listener, supervisor) end)
+    server = Task.async(fn -> Transport.serve(listener, supervisor, handler) end)
 
     slow = connect(path)
-    :ok = :gen_tcp.send(slow, ~s({"op":"symbols","path":"/repo/a.slow"}\n))
-    assert_receive {:blocked, handler}, 2_000
+    :ok = :gen_tcp.send(slow, ~s({"op":"symbols","path":"/repo/a.slow","cwd":"/nowhere"}\n))
+    assert_receive {:blocked, blocked}, 2_000
 
     # The daemon answers a second client while the first is still waiting.
     assert {:ok, response} = roundtrip(path, ~s({"op":"status"}\n))
     assert JSON.decode!(response)["result"]["state"] == "running"
 
-    send(handler, :release)
+    send(blocked, :release)
     assert {:ok, response} = :gen_tcp.recv(slow, 0, 5_000)
     assert JSON.decode!(response) == %{"ok" => true, "result" => %{"symbols" => []}}
     :gen_tcp.close(slow)
@@ -102,14 +112,13 @@ defmodule Symd.TransportTest do
     path = socket_path("sym-crash")
     {:ok, supervisor} = Task.Supervisor.start_link([])
 
-    workspace =
-      workspace(request: fn _lsp, _method, _params -> raise "handler boom" end)
+    handler = handler(request: fn _lsp, _method, _params -> raise "handler boom" end)
 
     {:ok, listener} = Transport.listen(path)
-    server = Task.async(fn -> Transport.serve(workspace, listener, supervisor) end)
+    server = Task.async(fn -> Transport.serve(listener, supervisor, handler) end)
 
     crashed = connect(path)
-    :ok = :gen_tcp.send(crashed, ~s({"op":"symbols","path":"/repo/a.slow"}\n))
+    :ok = :gen_tcp.send(crashed, ~s({"op":"symbols","path":"/repo/a.slow","cwd":"/nowhere"}\n))
     assert {:error, :closed} = :gen_tcp.recv(crashed, 0, 5_000)
     :gen_tcp.close(crashed)
 
@@ -125,7 +134,7 @@ defmodule Symd.TransportTest do
     {:ok, supervisor} = Task.Supervisor.start_link([])
 
     {:ok, listener} = Transport.listen(path)
-    server = Task.async(fn -> Transport.serve(workspace([]), listener, supervisor) end)
+    server = Task.async(fn -> Transport.serve(listener, supervisor, handler([])) end)
 
     assert {:ok, response} = roundtrip(path, ~s({"op":"stop"}\n))
     assert JSON.decode!(response)["result"]["state"] == "stopping"

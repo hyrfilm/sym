@@ -3,12 +3,64 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestMain lets this test binary impersonate symd: startDaemon launches
+// whatever --service names, and pointing it back at ourselves (with the
+// environment flag set) exercises real auto-start without a packaged daemon.
+func TestMain(m *testing.M) {
+	if os.Getenv("SYM_TEST_FAKE_SYMD") == "1" {
+		fakeSymdMain()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func fakeSymdMain() {
+	var socket string
+	for i, arg := range os.Args {
+		if arg == "--socket" && i+1 < len(os.Args) {
+			socket = os.Args[i+1]
+		}
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		os.Exit(1)
+	}
+	// A leak guard: this process must never outlive its test run.
+	time.AfterFunc(60*time.Second, func() { os.Exit(1) })
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			os.Exit(0)
+		}
+		var req map[string]any
+		if json.NewDecoder(conn).Decode(&req) != nil {
+			conn.Close()
+			continue
+		}
+		switch req["op"] {
+		case "status":
+			fmt.Fprintf(conn, `{"ok":true,"result":{"service":"symd","protocol":%d,"state":"running","pid":"%d","workspaces":[]}}`+"\n", protocol, os.Getpid())
+		case "stop":
+			fmt.Fprintf(conn, `{"ok":true,"result":{"service":"symd","protocol":%d,"state":"stopping"}}`+"\n", protocol)
+			conn.Close()
+			listener.Close()
+			os.Remove(socket)
+			os.Exit(0)
+		default:
+			fmt.Fprintln(conn, `{"ok":true,"result":{"definitions":[]}}`)
+		}
+		conn.Close()
+	}
+}
 
 // fakeDaemon answers one connection with a canned reply and reports the
 // request it received. The socket lives in /tmp rather than t.TempDir()
@@ -65,7 +117,7 @@ func TestSemanticRequestsAndLineOutput(t *testing.T) {
 			reply: `{"ok":true,"result":{"matches":[{"symbol":{"name":"createMidiScheduler","kind":"function","path":"` +
 				here("src/foo.ts") + `","line":3,"column":10},"refs":[{"path":"` + here("src/foo.ts") +
 				`","line":17,"column":5},{"path":"` + here("src/bar.ts") + `","line":82,"column":11}]}]}}`,
-			request: map[string]any{"op": "refs", "name": "createMidiScheduler"},
+			request: map[string]any{"op": "refs", "name": "createMidiScheduler", "cwd": cwd},
 			stdout:  "src/foo.ts:17:5\nsrc/bar.ts:82:11\n",
 		},
 		{
@@ -74,7 +126,7 @@ func TestSemanticRequestsAndLineOutput(t *testing.T) {
 			reply: `{"ok":true,"result":{"matches":[` +
 				`{"symbol":{"name":"parse","kind":"function","path":"/elsewhere/a.ts","line":1,"column":10},"refs":[{"path":"/elsewhere/b.ts","line":2,"column":3}]},` +
 				`{"symbol":{"name":"parse","kind":"method","container":"Parser","path":"/elsewhere/a.ts","line":9,"column":3},"refs":[]}]}}`,
-			request: map[string]any{"op": "refs", "name": "parse"},
+			request: map[string]any{"op": "refs", "name": "parse", "cwd": cwd},
 			stdout: "parse (function) /elsewhere/a.ts:1:10\n  /elsewhere/b.ts:2:3\n\n" +
 				"Parser.parse (method) /elsewhere/a.ts:9:3\n",
 		},
@@ -82,28 +134,28 @@ func TestSemanticRequestsAndLineOutput(t *testing.T) {
 			name:    "refs at a location parses FILE:LINE:COL from the right",
 			args:    []string{"refs", "--at", "src/parser.ts:42:8"},
 			reply:   `{"ok":true,"result":{"matches":[{"refs":[]}]}}`,
-			request: map[string]any{"op": "refs", "path": here("src/parser.ts"), "line": float64(42), "column": float64(8)},
+			request: map[string]any{"op": "refs", "path": here("src/parser.ts"), "line": float64(42), "column": float64(8), "cwd": cwd},
 			stdout:  "",
 		},
 		{
 			name:    "def by name describes each definition",
 			args:    []string{"def", "parse"},
 			reply:   `{"ok":true,"result":{"definitions":[{"name":"parse","kind":"method","container":"Parser","path":"/elsewhere/a.ts","line":9,"column":3}]}}`,
-			request: map[string]any{"op": "def", "name": "parse"},
+			request: map[string]any{"op": "def", "name": "parse", "cwd": cwd},
 			stdout:  "/elsewhere/a.ts:9:3\tParser.parse (method)\n",
 		},
 		{
 			name:    "def at a location prints bare places",
 			args:    []string{"def", "--at", "/abs/foo.ts:73:12"},
 			reply:   `{"ok":true,"result":{"definitions":[{"path":"/elsewhere/a.ts","line":9,"column":3}]}}`,
-			request: map[string]any{"op": "def", "path": "/abs/foo.ts", "line": float64(73), "column": float64(12)},
+			request: map[string]any{"op": "def", "path": "/abs/foo.ts", "line": float64(73), "column": float64(12), "cwd": cwd},
 			stdout:  "/elsewhere/a.ts:9:3\n",
 		},
 		{
 			name:    "symbols sends an absolute path and describes results",
 			args:    []string{"symbols", "src/parser.ts"},
 			reply:   `{"ok":true,"result":{"symbols":[{"name":"parse","kind":"function","path":"/elsewhere/a.ts","line":1,"column":10}]}}`,
-			request: map[string]any{"op": "symbols", "path": here("src/parser.ts")},
+			request: map[string]any{"op": "symbols", "path": here("src/parser.ts"), "cwd": cwd},
 			stdout:  "/elsewhere/a.ts:1:10\tparse (function)\n",
 		},
 	}
@@ -204,15 +256,99 @@ func TestInvalidArgumentsDoNotSendRequests(t *testing.T) {
 	}
 }
 
-func TestMissingDaemonExplainsHowToStartIt(t *testing.T) {
+// A query with no daemon running starts one instead of asking the user to.
+func TestQueriesAutoStartTheDaemon(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "sym-auto-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "symd.sock")
+	t.Setenv("SYM_TEST_FAKE_SYMD", "1")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		var stdout, stderr bytes.Buffer
+		run([]string{"--socket", socket, "stop"}, &stdout, &stderr)
+	})
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--socket", socket, "--service", exe, "def", "parse"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, &stderr)
+	}
+	// The daemon stays for the next query.
+	reply, err := daemonStatus(socket, time.Second)
+	if err != nil || !isRunning(reply) {
+		t.Fatalf("no daemon after auto-start: %v", err)
+	}
+}
+
+// A running daemon from before an upgrade speaks an older protocol. A query
+// must replace it and answer, not fail until someone remembers sym stop.
+func TestStaleProtocolDaemonIsReplaced(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "sym-stale-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "symd.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			var req map[string]any
+			if json.NewDecoder(conn).Decode(&req) != nil {
+				conn.Close()
+				continue
+			}
+			switch req["op"] {
+			case "status":
+				fmt.Fprintln(conn, `{"ok":true,"result":{"service":"symd","protocol":2,"state":"running","pid":"4242"}}`)
+			case "stop":
+				fmt.Fprintln(conn, `{"ok":true,"result":{"service":"symd","protocol":2,"state":"stopping"}}`)
+				conn.Close()
+				listener.Close()
+				os.Remove(socket)
+				return
+			default:
+				fmt.Fprintln(conn, `{"ok":false,"error":{"code":"invalid_request","message":"unknown field cwd"}}`)
+			}
+			conn.Close()
+		}
+	}()
+	t.Setenv("SYM_TEST_FAKE_SYMD", "1")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		var stdout, stderr bytes.Buffer
+		run([]string{"--socket", socket, "stop"}, &stdout, &stderr)
+	})
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--socket", socket, "--service", exe, "def", "parse"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, &stderr)
+	}
+}
+
+// Auto-start failures must explain themselves rather than loop or hang.
+func TestFailedAutoStartReportsTheServiceError(t *testing.T) {
 	dir, err := os.MkdirTemp("/tmp", "sym-missing-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--socket", filepath.Join(dir, "missing.sock"), "refs", "parse"}, &stdout, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), "sym start") {
-		t.Fatalf("exit %d without startup guidance: %s", code, &stderr)
+	args := []string{"--socket", filepath.Join(dir, "missing.sock"), "--service", "/does/not/exist/symd", "refs", "parse"}
+	code := run(args, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "cannot start symd") {
+		t.Fatalf("exit %d without a startup explanation: %s", code, &stderr)
 	}
 }

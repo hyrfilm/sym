@@ -2,12 +2,14 @@ defmodule Symd.CLI do
   @moduledoc """
   The small entry point for the `symd` executable.
 
-  It builds the workspace from the config file, starts the runtime processes
-  that own language-server clients, and serves the socket until a stop
-  request closes the listener.
+  It starts the runtime processes that own language-server clients and the
+  per-root workspace cache, then serves the socket until a stop request or
+  the idle watchdog closes the listener. Configuration is not read here:
+  every request carries the caller's working directory, and the workspace —
+  root and config — is resolved from it on demand.
   """
 
-  alias Symd.{Servers, Service, Transport}
+  alias Symd.{Idle, Servers, Service, Transport, Workspaces}
 
   @doc """
   Parses the flags and starts serving. This is the executable's boundary, so
@@ -15,42 +17,34 @@ defmodule Symd.CLI do
   return ordinary results for their callers to handle.
   """
   def main(args) do
-    {opts, rest, invalid} =
-      OptionParser.parse(args, strict: [config: :string, socket: :string, help: :boolean])
+    {opts, rest, invalid} = OptionParser.parse(args, strict: [socket: :string, help: :boolean])
 
     cond do
       opts[:help] ->
-        IO.puts("Usage: symd [--config sym.toml] [--socket .sym/symd.sock]")
+        IO.puts("Usage: symd [--socket ~/.sym/symd.sock]")
 
       rest != [] or invalid != [] ->
         fail("invalid arguments; use --help")
 
       true ->
-        # Read and check the config before opening a socket. A config error
-        # should leave us with an explanation, not a leftover socket file.
-        config = Keyword.get(opts, :config, "sym.toml")
-
-        case Service.open(config) do
-          {:ok, workspace} ->
-            run(workspace, opts)
-
-          {:error, reason} ->
-            fail("cannot open workspace from #{config}: #{Service.message(reason)}")
-        end
+        run(Keyword.get(opts, :socket, default_socket()))
     end
   end
 
-  defp run(workspace, opts) do
-    path = Keyword.get(opts, :socket, ".sym/symd.sock")
+  defp default_socket, do: Path.join(System.user_home!(), ".sym/symd.sock")
+
+  defp run(path) do
     :ok = Servers.start_runtime()
+    {:ok, _workspaces} = Workspaces.start_link([])
     {:ok, connections} = Task.Supervisor.start_link([])
 
     case Transport.listen(path) do
       {:ok, listener} ->
         IO.puts(:stderr, "symd listening on #{path}")
+        {:ok, _idle} = Idle.start_link(listener: listener, supervisor: connections)
 
         try do
-          Transport.serve(workspace, listener, connections)
+          Transport.serve(listener, connections)
         after
           # This handles normal returns and exceptions. A VM shutdown can
           # still leave a stale socket, which listen recovers next start.
