@@ -1,64 +1,119 @@
 # sym
 
-`sym` is a small Go CLI; `symd` is its Elixir service. The working commands install
-and list LSP packages. Semantic queries and running language servers come next.
+`sym` answers the questions coding agents usually mis-solve with grep: where
+is this defined, where is it referenced, what does this file declare. A small
+Go CLI talks to `symd`, an Elixir daemon that owns language-server processes
+and translates LSP into those answers.
+
+`sym` points at language servers; it does not install or manage them. Where
+an executable comes from — nix, npm, a checkout — is your business.
 
 ## Run
 
-From the repository root:
+Build and install the Nix package from a checkout:
 
 ```sh
-nix develop
-(cd symd && mix deps.get)
-just build
-./bin/symd --config sym.toml --socket /tmp/symd.sock
+nix build .
+nix profile add ./result
 ```
 
-Keep that terminal open. In another terminal, from the repository root:
+The package supplies the Erlang runtime; language servers are yours to
+provide. From a directory containing `sym.toml` (this repository includes one):
 
 ```sh
-./bin/sym --socket /tmp/symd.sock add --lsp typescript-language-server
-./bin/sym --socket /tmp/symd.sock add --lsp dexter
-./bin/sym --socket /tmp/symd.sock list
+sym start
+sym refs createMidiScheduler
+sym def parse
+sym def Parser.parse
+sym refs --at src/parser.ts:42:8
+sym symbols src/parser.ts
+sym stop
 ```
 
-If direnv has already loaded `.envrc`, skip `nix develop`; the tools are already
-on your PATH. The current `symd` executable needs Erlang's `escript` at runtime.
+`start` launches `symd` in the background and waits until it is ready;
+repeating it keeps the existing daemon. `stop` shuts down and removes the
+socket. A later start recovers a socket left behind by a crash, while
+preserving live listeners. Language servers start lazily on the first query
+that needs them, so the first answer per server is the slow one.
 
-Starting `symd` creates the profile directory configured in `sym.toml` if needed.
-The supplied configuration uses `.sym/profiles/symd-nix`; Nix owns the installed
-package state. Installation does not start the language servers.
+## Configuration
 
-For one-shot use, run `./bin/sym --oneshot list` inside the development shell.
-This starts `symd` for one request over stdin/stdout and exits. `just test` runs
-both projects' tests.
+Each `[lsp.<name>]` table in `sym.toml` says how to start one language server
+and which files it answers for:
+
+```toml
+[lsp.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+extensions = [".ts", ".tsx", ".js", ".jsx"]
+```
+
+`command` is an executable name looked up on PATH, or a path resolved against
+the config file's directory. The workspace root is the config file's
+directory. The default socket is `.sym/symd.sock`, relative to the working
+directory, and logs (including language-server stderr) go to
+`.sym/symd.sock.log`. To share a daemon across directories, pass the same
+absolute `--socket` path to all commands and an absolute `--config` path to
+`start`. Global flags go before the command.
+
+## Answers
+
+The default output is one `path:line:col` per line — the shape every tool
+already parses — with a tab-separated `name (kind)` description where one
+exists. Lines and columns are 1-based; columns count codepoints. `--json`
+prints the result object instead, with absolute paths.
+
+```sh
+$ sym refs createMidiScheduler
+src/foo.ts:17:5
+src/bar.ts:82:11
+```
+
+Names are search terms; locations are authoritative. A dotted name
+(`Parser.parse`) narrows by container. When a name matches several symbols,
+the reply groups references per symbol; past five matches it returns the
+candidate definitions instead and exits with status 3, so an agent knows to
+narrow with a qualified name or `--at FILE:LINE:COL` rather than parse refs.
+Exit codes: 0 answered, 1 failure, 2 bad usage, 3 too ambiguous.
+
+Files are re-read from disk and re-sent to the server on every query, so
+answers reflect edits made since the last one. Definition and reference
+queries also wait (bounded) while a server reports indexing progress, because
+an answer computed during a project load is confidently incomplete.
 
 ## CLI / service protocol
 
-[cli/](cli/README.md) parses arguments, sends one request, prints the JSON reply,
-and exits. [symd/](symd/README.md) reads configuration and owns package commands.
-The transport uses one JSON request line and one JSON reply line per Unix socket
-connection. One-shot mode uses the same messages. The default socket is
-`.sym/symd.sock`; the examples select `/tmp/symd.sock` explicitly.
+[cli/](cli/README.md) parses arguments, sends one JSON request line over the
+Unix socket, formats the JSON reply, and exits. It also launches its
+companion daemon on `start`. [symd/](symd/README.md) owns configuration,
+language-server processes, and the semantic operations. One request per
+connection; requests carry `op` (`symbols`, `def`, `refs`, `status`, `stop`)
+plus either `name` or `path`[+`line`+`column`], with absolute paths:
 
 ```json
-{"op":"add","lsp":"dexter"}
-{"ok":true,"result":{"lsp":"dexter"}}
-```
-
-```json
-{"op":"list"}
-{"ok":true,"result":{"lsps":["dexter","typescript-language-server"]}}
+{"op":"refs","name":"createMidiScheduler"}
+{"ok":true,"result":{"matches":[{"symbol":{...},"refs":[{"path":"...","line":17,"column":5}]}]}}
 ```
 
 Failures use `{"ok":false,"error":{"code":"...","message":"..."}}` and make
-the CLI exit with status 1. Diagnostics go to stderr. Global CLI options, such as
-`--socket`, go before the command.
+the CLI exit with status 1. Daemon `status` returns `service: "symd"`,
+`protocol: 2`, `state: "running"`, and its process ID inside the result;
+`stop` acknowledges `state: "stopping"` and the CLI waits for socket cleanup.
 
-The service handles requests sequentially. Startup refuses an existing socket;
-if an interrupted service leaves one behind, remove the socket file only after
-confirming that service has stopped.
+## Develop
 
-Future semantic operations include symbols, references, and definitions. Their
-external locations use only `path:line:column`, with 1-based line and column,
-parsed from the right. Locations are authoritative; names are search terms.
+```sh
+nix develop
+just build
+just check
+```
+
+With direnv active, skip `nix develop`. `just build` fetches Mix dependencies
+and builds the development executables into `bin/`; that development `symd`
+still uses the shell's Erlang runtime. `just check` runs tests, formatting
+checks, and Go vet. `just package` builds the local Nix package into
+`result/`, and `just test-package` checks it with a bare runtime PATH,
+including crash recovery.
+
+Before new source files are tracked by Git, use `just package path:.` with the
+daemon stopped; that copies the local directory instead of Git's tracked files.

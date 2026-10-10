@@ -1,4 +1,6 @@
 /bin/
+/cli/cli
+/result
 /.sym/
 **/.elixir_ls/
 /.direnv/

@@ -1,74 +1,164 @@
 defmodule Symd.TransportTest do
   use ExUnit.Case, async: true
 
-  alias Symd.{Profile, Transport}
+  alias Symd.{Transport, Workspace}
 
-  setup do
-    profile = %Profile{
-      add: fn "dexter" -> :ok end,
-      list: fn -> {:ok, []} end,
-      remove: fn _ -> flunk("unexpected remove") end,
-      command: fn _ -> flunk("unexpected command") end
-    }
+  @slow_lsp %{name: "slow", command: "x", args: [], extensions: [".slow"]}
 
-    %{profile: profile}
+  defp workspace(overrides) do
+    struct!(
+      %Workspace{
+        root: "/nowhere",
+        lsps: [@slow_lsp],
+        request: fn _lsp, method, _params -> flunk("unexpected request #{method}") end,
+        sync: fn _lsp, _path -> {:ok, ""} end
+      },
+      overrides
+    )
   end
 
-  test "one-shot mode reads a request and writes exactly one response", %{profile: profile} do
-    {:ok, input} = StringIO.open(~s({"op":"add","lsp":"dexter"}\n))
-    {:ok, output} = StringIO.open("")
-
-    assert Transport.once(profile, input, output) == 0
-    assert {"", response} = StringIO.contents(output)
-    assert JSON.decode!(response) == %{"ok" => true, "result" => %{"lsp" => "dexter"}}
-    assert length(String.split(response, "\n", trim: true)) == 1
-  end
-
-  test "one-shot mode returns an error and exit status 1 for missing, malformed, or oversized input",
-       %{profile: profile} do
-    # Valid JSON behind 64 KiB of spaces: only the size limit can reject it. If
-    # it got through, `list` would succeed and the exit status would be 0.
-    oversized = String.duplicate(" ", 65_536) <> ~s({"op":"list"}\n)
-
-    for request <- ["", "{\n", oversized] do
-      {:ok, input} = StringIO.open(request)
-      {:ok, output} = StringIO.open("")
-
-      assert Transport.once(profile, input, output) == 1
-      assert {"", response} = StringIO.contents(output)
-
-      assert %{"ok" => false, "error" => %{"code" => "invalid_request"}} = JSON.decode!(response)
-    end
-  end
-
-  test "socket mode preserves its listener and serves clients after a malformed request", %{
-    profile: profile
-  } do
-    # Keep Unix socket paths below macOS's length limit, even when TMPDIR is long.
-    path = "/tmp/sym-#{System.pid()}-#{System.unique_integer([:positive])}.sock"
+  # Keep Unix socket paths below macOS's length limit, even when TMPDIR is long.
+  defp socket_path(prefix) do
+    path = "/tmp/#{prefix}-#{System.pid()}-#{System.unique_integer([:positive])}.sock"
     on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  defp connect(path) do
+    {:ok, socket} =
+      :gen_tcp.connect({:local, String.to_charlist(path)}, 0, [
+        :binary,
+        active: false,
+        packet: :line
+      ])
+
+    socket
+  end
+
+  defp roundtrip(path, request) do
+    socket = connect(path)
+    :ok = :gen_tcp.send(socket, request)
+    reply = :gen_tcp.recv(socket, 0, 5_000)
+    :gen_tcp.close(socket)
+    reply
+  end
+
+  test "socket mode preserves its listener and serves clients after a malformed request" do
+    path = socket_path("sym")
+    {:ok, supervisor} = Task.Supervisor.start_link([])
 
     assert {:ok, listener} = Transport.listen(path)
-    server = Task.async(fn -> Transport.serve(profile, listener) end)
-    assert {:error, _} = Transport.listen(path)
+    server = Task.async(fn -> Transport.serve(workspace([]), listener, supervisor) end)
+    assert {:error, _taken} = Transport.listen(path)
     assert File.exists?(path)
 
-    for {request, expected} <- [{"{\n", false}, {~s({"op":"list"}\n), true}] do
-      {:ok, socket} =
-        :gen_tcp.connect({:local, String.to_charlist(path)}, 0, [
-          :binary,
-          active: false,
-          packet: :line
-        ])
-
-      :ok = :gen_tcp.send(socket, request)
-      assert {:ok, response} = :gen_tcp.recv(socket, 0, 1_000)
+    for {request, expected} <- [{"{\n", false}, {~s({"op":"status"}\n), true}] do
+      assert {:ok, response} = roundtrip(path, request)
       assert JSON.decode!(response)["ok"] == expected
-      assert {:error, :closed} = :gen_tcp.recv(socket, 0, 1_000)
-      :gen_tcp.close(socket)
     end
 
     :gen_tcp.close(listener)
     assert Task.await(server) == :ok
+  end
+
+  test "a slow request does not block a later client" do
+    path = socket_path("sym-slow")
+    {:ok, supervisor} = Task.Supervisor.start_link([])
+    parent = self()
+
+    workspace =
+      workspace(
+        request: fn @slow_lsp, "textDocument/documentSymbol", _params ->
+          send(parent, {:blocked, self()})
+
+          receive do
+            :release -> {:ok, []}
+          end
+        end
+      )
+
+    {:ok, listener} = Transport.listen(path)
+    server = Task.async(fn -> Transport.serve(workspace, listener, supervisor) end)
+
+    slow = connect(path)
+    :ok = :gen_tcp.send(slow, ~s({"op":"symbols","path":"/repo/a.slow"}\n))
+    assert_receive {:blocked, handler}, 2_000
+
+    # The daemon answers a second client while the first is still waiting.
+    assert {:ok, response} = roundtrip(path, ~s({"op":"status"}\n))
+    assert JSON.decode!(response)["result"]["state"] == "running"
+
+    send(handler, :release)
+    assert {:ok, response} = :gen_tcp.recv(slow, 0, 5_000)
+    assert JSON.decode!(response) == %{"ok" => true, "result" => %{"symbols" => []}}
+    :gen_tcp.close(slow)
+
+    :gen_tcp.close(listener)
+    assert Task.await(server) == :ok
+  end
+
+  @tag capture_log: true
+  test "a crashing handler spoils one connection, not the daemon" do
+    path = socket_path("sym-crash")
+    {:ok, supervisor} = Task.Supervisor.start_link([])
+
+    workspace =
+      workspace(request: fn _lsp, _method, _params -> raise "handler boom" end)
+
+    {:ok, listener} = Transport.listen(path)
+    server = Task.async(fn -> Transport.serve(workspace, listener, supervisor) end)
+
+    crashed = connect(path)
+    :ok = :gen_tcp.send(crashed, ~s({"op":"symbols","path":"/repo/a.slow"}\n))
+    assert {:error, :closed} = :gen_tcp.recv(crashed, 0, 5_000)
+    :gen_tcp.close(crashed)
+
+    assert {:ok, response} = roundtrip(path, ~s({"op":"status"}\n))
+    assert JSON.decode!(response)["ok"] == true
+
+    :gen_tcp.close(listener)
+    assert Task.await(server) == :ok
+  end
+
+  test "a stop request acknowledges, closes the listener, and ends serve" do
+    path = socket_path("sym-stop")
+    {:ok, supervisor} = Task.Supervisor.start_link([])
+
+    {:ok, listener} = Transport.listen(path)
+    server = Task.async(fn -> Transport.serve(workspace([]), listener, supervisor) end)
+
+    assert {:ok, response} = roundtrip(path, ~s({"op":"stop"}\n))
+    assert JSON.decode!(response)["result"]["state"] == "stopping"
+    assert Task.await(server, 5_000) == :ok
+  end
+
+  test "startup recovers a socket left behind by a stopped process" do
+    path = socket_path("sym-stale")
+    assert {:ok, old_listener} = Transport.listen(path)
+    :gen_tcp.close(old_listener)
+    assert File.exists?(path)
+
+    assert {:ok, listener} = Transport.listen(path)
+    :gen_tcp.close(listener)
+  end
+
+  test "startup never removes a regular file or a symlink in place of a socket" do
+    path = "/tmp/sym-file-#{System.pid()}-#{System.unique_integer([:positive])}"
+    target = path <> ".target"
+
+    on_exit(fn ->
+      File.rm(path)
+      File.rm(target)
+    end)
+
+    File.write!(path, "keep me")
+    assert {:error, _refused} = Transport.listen(path)
+    assert File.read!(path) == "keep me"
+
+    File.rename!(path, target)
+    File.ln_s!(target, path)
+    assert {:error, _refused} = Transport.listen(path)
+    assert File.read_link!(path) == target
+    assert File.read!(target) == "keep me"
   end
 end

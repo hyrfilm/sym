@@ -2,10 +2,11 @@ defmodule Symd.Transport do
   @moduledoc """
   Gets requests into the service and replies back to the caller.
 
-  Our CLI protocol is one JSON line each way. Socket mode handles one request
-  per connection; one-shot mode does the same over stdin/stdout. Both dispatch
-  through `Symd.Service`, so choosing a transport doesn't change the operation.
-  This is our own protocol, separate from the LSP framing we'll eventually use.
+  Our CLI protocol is one JSON line each way, one request per connection.
+  Each accepted connection is handled in its own supervised task, so a slow
+  semantic query — a language server starting cold can take seconds — never
+  blocks the next client, and a crash spoils one connection only. This is our
+  own protocol, separate from the LSP framing the daemon speaks to servers.
   """
 
   alias Symd.Service
@@ -13,21 +14,13 @@ defmodule Symd.Transport do
 
   @doc """
   Opens a Unix socket and restricts its permissions before we start serving it.
-  An existing path is an error: it might belong to a live daemon, so startup
-  mustn't unlink it to make room for another one.
+  A crashed VM may have left its socket behind. We recover only when a connection
+  is refused and the path still identifies that same socket; live listeners and
+  other kinds of files stay untouched. Recovery retries the bind once.
   """
   def listen(path) do
     with :ok <- File.mkdir_p(Path.dirname(path)),
-         # :gen_tcp also supports Unix sockets. Passive line mode lets us
-         # receive complete request lines without writing our own buffer.
-         {:ok, socket} <-
-           :gen_tcp.listen(0, [
-             :binary,
-             active: false,
-             packet: :line,
-             packet_size: @max_line,
-             ifaddr: {:local, String.to_charlist(path)}
-           ]) do
+         {:ok, socket} <- bind(path, true) do
       case File.chmod(path, 0o600) do
         :ok ->
           {:ok, socket}
@@ -40,29 +33,83 @@ defmodule Symd.Transport do
     end
   end
 
-  @doc """
-  Serves clients one at a time until the listener closes.
-  A client gets five seconds to send its line; package installation itself
-  may take longer. This keeps writes through this daemon sequential without
-  adding a job system or a process for every request.
-  """
-  def serve(profile, listener) do
-    case :gen_tcp.accept(listener) do
-      {:ok, socket} ->
-        try do
-          response =
-            case :gen_tcp.recv(socket, 0, 5_000) do
-              {:ok, line} -> Service.request(profile, line)
-              {:error, reason} -> Service.error("invalid_request", reason)
-            end
+  defp bind(path, recover?) do
+    # Passive line mode gives us complete CLI requests. It isn't LSP framing.
+    case :gen_tcp.listen(0, [
+           :binary,
+           active: false,
+           packet: :line,
+           packet_size: @max_line,
+           ifaddr: {:local, String.to_charlist(path)}
+         ]) do
+      {:error, :eaddrinuse} when recover? -> recover_socket(path)
+      result -> result
+    end
+  end
 
-          :gen_tcp.send(socket, [JSON.encode!(response), "\n"])
-        after
-          # Each request owns this connection, even when handling it raises.
-          :gen_tcp.close(socket)
+  defp recover_socket(path) do
+    case File.lstat(path) do
+      {:error, :enoent} ->
+        bind(path, false)
+
+      {:ok, stat} when Bitwise.band(stat.mode, 0o170000) == 0o140000 ->
+        case :gen_tcp.connect(
+               {:local, String.to_charlist(path)},
+               0,
+               [:binary, active: false],
+               250
+             ) do
+          {:ok, connection} ->
+            :gen_tcp.close(connection)
+            {:error, :eaddrinuse}
+
+          {:error, :econnrefused} ->
+            remove_stale_socket(path, stat)
+
+          {:error, :enoent} ->
+            bind(path, false)
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
-        serve(profile, listener)
+      _file_or_error ->
+        {:error, :eaddrinuse}
+    end
+  end
+
+  defp remove_stale_socket(path, original) do
+    # Check again after the probe: another start may already have replaced the
+    # stale path. This is best-effort recovery in a directory the user controls,
+    # not an atomic compare-and-unlink operation in a shared writable directory.
+    case File.lstat(path) do
+      {:ok, current}
+      when current.inode == original.inode and current.major_device == original.major_device and
+             current.minor_device == original.minor_device and current.mode == original.mode ->
+        case File.rm(path) do
+          :ok -> bind(path, false)
+          {:error, :enoent} -> bind(path, false)
+          error -> error
+        end
+
+      {:error, :enoent} ->
+        bind(path, false)
+
+      _changed_or_error ->
+        {:error, :eaddrinuse}
+    end
+  end
+
+  @doc """
+  Accepts connections until the listener closes and hands each one to a task
+  under `supervisor`. A stop request closes the listener from its handler,
+  which ends this loop; requests still in flight die with the VM.
+  """
+  def serve(workspace, listener, supervisor) do
+    case :gen_tcp.accept(listener) do
+      {:ok, socket} ->
+        hand_off(workspace, socket, listener, supervisor)
+        serve(workspace, listener, supervisor)
 
       {:error, :closed} ->
         :ok
@@ -72,27 +119,48 @@ defmodule Symd.Transport do
     end
   end
 
-  @doc """
-  Reads one request, writes one reply, and returns exit status 0 or 1.
-  The caller owns exiting the VM. Tests can pass StringIO devices here and
-  inspect the same wire messages without starting a subprocess.
-  """
-  def once(profile, input \\ :stdio, output \\ :stdio) do
+  defp hand_off(workspace, socket, listener, supervisor) do
+    # The task may only touch the socket once it owns it, so it waits for the
+    # ownership transfer to complete before reading.
+    {:ok, task} =
+      Task.Supervisor.start_child(supervisor, fn ->
+        receive do
+          {:handle, owned} -> handle_connection(workspace, owned, listener)
+        after
+          5_000 -> :ok
+        end
+      end)
+
+    case :gen_tcp.controlling_process(socket, task) do
+      :ok -> send(task, {:handle, socket})
+      {:error, _reason} -> :gen_tcp.close(socket)
+    end
+  end
+
+  defp handle_connection(workspace, socket, listener) do
+    # A client gets five seconds to send its line; answering it may take as
+    # long as the language servers need.
     response =
-      case IO.binread(input, :line) do
-        # Socket line mode checks this limit for us; stdio needs its own check
-        # before we hand the line to the service.
-        line when is_binary(line) and byte_size(line) > @max_line ->
-          Service.error("invalid_request", "request exceeds #{@max_line} bytes")
-
-        line when is_binary(line) ->
-          Service.request(profile, line)
-
-        _eof_or_error ->
-          Service.error("invalid_request", "expected one JSON request line")
+      case :gen_tcp.recv(socket, 0, 5_000) do
+        {:ok, line} -> Service.request(workspace, line)
+        {:error, reason} -> Service.error("invalid_request", reason)
       end
 
-    IO.binwrite(output, [JSON.encode!(response), "\n"])
-    if response["ok"], do: 0, else: 1
+    case response do
+      {:daemon, :stop, reply} ->
+        :gen_tcp.send(socket, [JSON.encode!(reply), "\n"])
+        # Closing the listener is the shutdown signal: the accept loop
+        # returns and the executable removes its socket file.
+        :gen_tcp.close(listener)
+
+      {:daemon, _control, reply} ->
+        :gen_tcp.send(socket, [JSON.encode!(reply), "\n"])
+
+      reply ->
+        :gen_tcp.send(socket, [JSON.encode!(reply), "\n"])
+    end
+  after
+    # Each request owns this connection, even when handling it raises.
+    :gen_tcp.close(socket)
   end
 end

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,21 +8,27 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
-// request is the one JSON object we send to symd per invocation. Op is "add" or
-// "list"; LSP is only filled in for "add" and is left out of the JSON otherwise.
+// request is the one JSON object we send to symd per invocation. A semantic
+// request carries either a name or a path (symbols), or a path+line+column
+// location; management requests carry just the op.
 type request struct {
-	Op  string `json:"op"`
-	LSP string `json:"lsp,omitempty"`
+	Op     string `json:"op"`
+	Name   string `json:"name,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Line   int    `json:"line,omitempty"`
+	Column int    `json:"column,omitempty"`
 }
 
 // response mirrors symd's reply envelope: either ok=true with a result, or
-// ok=false with an error. Result stays raw so we can print it back exactly as
-// symd sent it, without knowing its shape.
+// ok=false with an error. Result stays raw so the semantic formatting below
+// can decode it, and --json can print it back exactly as symd sent it.
 type response struct {
 	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
@@ -37,19 +42,22 @@ type response struct {
 // so the real logic stays testable without calling os.Exit in a test.
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
-// run is the whole CLI: parse flags and the subcommand, build one request, send
-// it (either to the daemon socket or to a fresh symd process), then print the
-// reply. Exit codes: 0 success, 1 symd or transport failure, 2 bad usage.
-// Nothing is sent when the arguments are wrong.
+// run is the whole CLI: parse flags and the subcommand, build one request,
+// send it to the daemon socket, then format the reply. Exit codes: 0 success,
+// 1 symd or transport failure, 2 bad usage, 3 a name query too ambiguous to
+// answer. Nothing is sent when the arguments are wrong.
 func run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("sym", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socket := flags.String("socket", ".sym/symd.sock", "symd Unix socket")
-	oneshot := flags.Bool("oneshot", false, "invoke symd once over stdin/stdout")
-	config := flags.String("config", "sym.toml", "TOML file for one-shot mode")
-	service := flags.String("service", siblingService(), "symd executable for one-shot mode")
+	config := flags.String("config", "sym.toml", "TOML file passed to symd on start")
+	service := flags.String("service", siblingService(), "symd executable")
+	asJSON := flags.Bool("json", false, "print the raw result object instead of location lines")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: sym [options] add --lsp NAME | list")
+		fmt.Fprintln(stderr, "Usage: sym [options] refs NAME | refs --at FILE:LINE:COL")
+		fmt.Fprintln(stderr, "                     def NAME  | def --at FILE:LINE:COL")
+		fmt.Fprintln(stderr, "                     symbols FILE")
+		fmt.Fprintln(stderr, "                     start | status | stop")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -62,56 +70,116 @@ func run(args []string, stdout, stderr io.Writer) int {
 		flags.Usage()
 		return 2
 	}
-	// Global flags stop at the first non-flag word, so everything after it is the
-	// subcommand and its own arguments. "add" gets its own flag set for --lsp.
+	// Global flags stop at the first non-flag word, so everything after it is
+	// the subcommand and its own arguments.
 	command := flags.Args()
 	var req request
 	switch command[0] {
-	case "add":
-		add := flag.NewFlagSet("add", flag.ContinueOnError)
-		add.SetOutput(stderr)
-		lsp := add.String("lsp", "", "language server name")
-		if err := add.Parse(command[1:]); err != nil {
+	case "def", "refs":
+		locate := flag.NewFlagSet(command[0], flag.ContinueOnError)
+		locate.SetOutput(stderr)
+		at := locate.String("at", "", "FILE:LINE:COL")
+		usage := func() int {
+			fmt.Fprintf(stderr, "Usage: sym [options] %s NAME | %s --at FILE:LINE:COL\n", command[0], command[0])
 			return 2
 		}
-		if *lsp == "" || add.NArg() != 0 {
-			fmt.Fprintln(stderr, "Usage: sym [options] add --lsp NAME")
+		if err := locate.Parse(command[1:]); err != nil {
 			return 2
 		}
-		req = request{Op: "add", LSP: *lsp}
-	case "list":
+		switch {
+		case *at != "" && locate.NArg() == 0:
+			path, line, column, err := parseLocation(*at)
+			if err != nil {
+				fmt.Fprintf(stderr, "sym: %v\n", err)
+				return 2
+			}
+			req = request{Op: command[0], Path: path, Line: line, Column: column}
+		case *at == "" && locate.NArg() == 1:
+			req = request{Op: command[0], Name: locate.Arg(0)}
+		default:
+			return usage()
+		}
+	case "symbols":
+		if len(command) != 2 {
+			fmt.Fprintln(stderr, "Usage: sym [options] symbols FILE")
+			return 2
+		}
+		path, err := filepath.Abs(command[1])
+		if err != nil {
+			fmt.Fprintf(stderr, "sym: %v\n", err)
+			return 2
+		}
+		req = request{Op: command[0], Path: path}
+	case "start", "status", "stop":
 		if len(command) != 1 {
-			fmt.Fprintln(stderr, "Usage: sym [options] list")
+			fmt.Fprintf(stderr, "Usage: sym [options] %s\n", command[0])
 			return 2
 		}
-		req = request{Op: "list"}
+		req = request{Op: command[0]}
 	default:
 		flags.Usage()
 		return 2
 	}
 
-	// Two ways to reach symd: the long-running daemon over its Unix socket, or a
-	// one-off symd process that reads the request on stdin. Both return the same
-	// response shape, so the printing below doesn't care which one ran.
 	var reply response
 	var err error
-	if *oneshot {
-		reply, err = oneShotRequest(*service, *config, req, stderr)
-	} else {
+	switch req.Op {
+	case "start":
+		reply, err = startDaemon(*service, *config, *socket)
+	case "status":
+		reply, err = daemonStatus(*socket, time.Second)
+	case "stop":
+		reply, err = stopDaemon(*socket)
+	default:
 		reply, err = socketRequest(*socket, req)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "sym: %v\n", err)
 		return 1
 	}
-	if err := json.NewEncoder(stdout).Encode(reply); err != nil {
-		fmt.Fprintf(stderr, "sym: %v\n", err)
-		return 1
+	switch req.Op {
+	case "start", "status", "stop":
+		// Management replies stay whole envelopes: scripts check their state.
+		if err := json.NewEncoder(stdout).Encode(reply); err != nil {
+			fmt.Fprintf(stderr, "sym: %v\n", err)
+			return 1
+		}
+		if !reply.OK {
+			return 1
+		}
+		return 0
+	default:
+		return printSemantic(req, reply, *asJSON, stdout, stderr)
 	}
-	if !reply.OK {
-		return 1
+}
+
+// parseLocation splits FILE:LINE:COL from the right, so paths containing
+// colons still work, and returns the file as an absolute path. Line and
+// column are 1-based.
+func parseLocation(location string) (string, int, int, error) {
+	malformed := fmt.Errorf("expected FILE:LINE:COL with 1-based line and column, got %q", location)
+	last := strings.LastIndex(location, ":")
+	if last < 0 {
+		return "", 0, 0, malformed
 	}
-	return 0
+	column, err := strconv.Atoi(location[last+1:])
+	if err != nil || column < 1 {
+		return "", 0, 0, malformed
+	}
+	rest := location[:last]
+	last = strings.LastIndex(rest, ":")
+	if last < 1 {
+		return "", 0, 0, malformed
+	}
+	line, err := strconv.Atoi(rest[last+1:])
+	if err != nil || line < 1 {
+		return "", 0, 0, malformed
+	}
+	path, err := filepath.Abs(rest[:last])
+	if err != nil {
+		return "", 0, 0, err
+	}
+	return path, line, column, nil
 }
 
 // siblingService points -service at a symd binary sitting next to sym itself,
@@ -125,43 +193,31 @@ func siblingService() string {
 	return filepath.Join(filepath.Dir(path), "symd")
 }
 
-// oneShotRequest runs symd once, writes the request to its stdin, and reads the
-// reply from stdout. The tricky part is exit codes: symd exits non-zero for
-// failures like a failed package install, but it still prints a proper error
-// envelope. So we only call it a transport failure when there's no output at
-// all. If there is output, we return the reply and let run print it.
-func oneShotRequest(service, config string, req request, stderr io.Writer) (response, error) {
-	var input bytes.Buffer
-	if err := json.NewEncoder(&input).Encode(req); err != nil {
-		return response{}, err
-	}
-	command := exec.Command(service, "--oneshot", "--config", config)
-	command.Stdin = &input
-	command.Stderr = stderr
-	output, commandErr := command.Output()
-	if commandErr != nil && len(output) == 0 {
-		return response{}, fmt.Errorf("symd: %w", commandErr)
-	}
-	reply, err := decodeResponse(bytes.NewReader(output))
-	if err != nil {
-		return reply, err
-	}
-	if commandErr != nil && reply.OK {
-		return reply, fmt.Errorf("symd: %w", commandErr)
-	}
-	return reply, nil
-}
-
 // socketRequest sends one request line to the daemon and reads one reply line.
 // The connection is closed when we're done, so every call is its own round trip.
-// Only the dial has a timeout (3s); reading the reply has no deadline, so a hung
-// daemon would block here.
+// Only the dial has a timeout (3s); reading the reply has no deadline, because
+// a cold language server may legitimately take a while to answer.
 func socketRequest(path string, req request) (response, error) {
+	reply, err := socketRequestWithin(path, req, 0)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+		return response{}, fmt.Errorf("symd is not running at %s; run sym start with the same --socket setting", path)
+	}
+	return reply, err
+}
+
+// Management probes have a short deadline; semantic requests keep their
+// open-ended wait.
+func socketRequestWithin(path string, req request, timeout time.Duration) (response, error) {
 	conn, err := net.DialTimeout("unix", path, 3*time.Second)
 	if err != nil {
 		return response{}, err
 	}
 	defer conn.Close()
+	if timeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			return response{}, err
+		}
+	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return response{}, err
 	}
@@ -169,12 +225,12 @@ func socketRequest(path string, req request) (response, error) {
 }
 
 // decodeResponse parses symd's reply and checks that it's a valid envelope. The
-// reader is capped at 1 MiB so a runaway process can't make us read forever. We
+// reader is capped at 16 MiB so a runaway process can't make us read forever. We
 // also reject replies that claim ok but have no result, or claim failure but
 // have no error, because those can't be printed or explained to the user.
 func decodeResponse(reader io.Reader) (response, error) {
 	var reply response
-	if err := json.NewDecoder(io.LimitReader(reader, 1024*1024)).Decode(&reply); err != nil {
+	if err := json.NewDecoder(io.LimitReader(reader, 16*1024*1024)).Decode(&reply); err != nil {
 		return reply, fmt.Errorf("invalid symd response: %w", err)
 	}
 	if (reply.OK && len(reply.Result) == 0) || (!reply.OK && reply.Error == nil) {

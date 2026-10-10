@@ -1,4 +1,12 @@
-[profile]
-name = "symd-nix"
-type = "nix"
-location = ".sym/profiles/symd-nix"
+# Points sym at language servers. Where an executable comes from (nix, npm,
+# a checkout) is not sym's business: name one on PATH, or give a path
+# relative to this file.
+
+[lsp.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+extensions = [".ts", ".tsx", ".js", ".jsx"]
+[lsp.elixir]
+command = "dexter"
+args = ["--stdio"]
+extensions = [".ex", ".exs"]

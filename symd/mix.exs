@@ -7,6 +7,8 @@ defmodule Symd.MixProject do
       version: "0.1.0",
       elixir: "~> 1.20",
       escript: [main_module: Symd.CLI, path: "../bin/symd"],
+      # test/support holds the scripted fake language server, not tests.
+      test_ignore_filters: [~r{^test/support/}],
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
