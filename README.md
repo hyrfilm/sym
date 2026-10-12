@@ -114,6 +114,16 @@ with absolute paths, put `--json` before the command:
 sym --json refs createMidiScheduler
 ```
 
+To see each reference's source line after its location, separated by a
+tab, put `--source` before the command:
+
+```sh
+sym --source refs createMidiScheduler
+```
+
+A reference query at a position that isn't on a symbol fails with
+`no_symbol_at` instead of printing nothing.
+
 When a reference query matches several symbols, sym groups the results by
 symbol. With more than five matches, it prints the possible definitions
 instead. Use a qualified name or `--at` to narrow the query. Exit codes are
@@ -136,6 +146,12 @@ The default socket is `~/.sym/symd.sock`, and the log is
 `~/.sym/symd.sock.log`. Set `SYM_SOCKET` or pass `--socket` before the command
 to use a different socket. Its log has the same path with `.log` appended.
 More options are described in the [CLI documentation](cli/README.md).
+
+## Feedback
+
+`sym --feedback "TEXT"` appends one line to `~/.sym/feedback.txt`, and
+`sym --feedback` prints the notes written so far. It's meant for agents (and
+people) to note a missing feature or a problem at the moment they hit it.
 
 ## How it works
 

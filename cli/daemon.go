@@ -14,7 +14,7 @@ import (
 
 // protocol is the CLI/daemon wire version. Both halves ship together; the
 // check catches a daemon left running across a package upgrade.
-const protocol = 3
+const protocol = 4
 
 // The CLI only launches its companion and talks to its management protocol.
 // There is no PID file to trust, and stop never signals an arbitrary process.

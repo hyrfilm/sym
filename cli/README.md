@@ -26,18 +26,23 @@ an upgrade), the query stops it, starts a fresh one, and retries once.
 colons work. File arguments become absolute paths before they are sent; the
 daemon replies with absolute paths and the CLI prints them relative to the
 working directory when they fall inside it. `--json` prints the raw result
-object instead of location lines.
+object instead of location lines. `--source` adds each reference's source
+line, which the daemon sends with every location, after a tab.
+
+`--feedback "TEXT"` appends one line to `~/.sym/feedback.txt`; `--feedback`
+alone prints the file. It must be the first argument and never contacts the
+daemon.
 
 `start` launches the companion with separate arguments, no shell, and waits
-for a compatible status reply (protocol 3). Output, including language-server
+for a compatible status reply (protocol 4). Output, including language-server
 stderr, goes to `<socket>.log`. `stop` sends a socket request and waits for
 cleanup; it never kills a process based on a PID file. Both commands are safe
 to repeat, and the daemon also stops itself after 30 idle minutes.
 
 The default socket is `~/.sym/symd.sock` — one daemon per user, reachable
 from every directory. The `SYM_SOCKET` environment variable overrides it,
-and the `--socket` flag overrides both; `--socket`, `--service`, and
-`--json` are global flags and go before the command.
+and the `--socket` flag overrides both; `--socket`, `--service`,
+`--json`, and `--source` are global flags and go before the command.
 `--service /path/to/symd` overrides the companion executable.
 
 Exit status: 0 answered, 1 service/connection failure, 2 bad usage, 3 a name

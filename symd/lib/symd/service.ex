@@ -12,7 +12,7 @@ defmodule Symd.Service do
 
   alias Symd.{Semantic, Workspaces}
 
-  @protocol 3
+  @protocol 4
 
   @doc """
   Decodes a request and passes it to `handle/2`. Bad JSON becomes an error
@@ -130,6 +130,7 @@ defmodule Symd.Service do
   defp code({:no_lsp_for_path, _path, _extensions}), do: "unsupported_file"
   defp code({:no_lsp_for_workspace, _root, _extensions}), do: "unsupported_workspace"
   defp code({:symbol_not_found, _name, _similar}), do: "symbol_not_found"
+  defp code({:no_symbol_at, _path, _line, _column}), do: "no_symbol_at"
   defp code({:file_read, _path, _reason}), do: "file_unreadable"
   defp code({:executable_not_found, _command}), do: "lsp_unavailable"
   defp code({:server_exited, _status}), do: "lsp_unavailable"
@@ -179,6 +180,9 @@ defmodule Symd.Service do
 
   def message({:symbol_not_found, name, similar}),
     do: ~s(no symbol named "#{name}"; the servers suggest: #{Enum.join(similar, ", ")})
+
+  def message({:no_symbol_at, path, line, column}),
+    do: "no symbol at #{path}:#{line}:#{column}"
 
   def message({:file_read, path, reason}), do: "cannot read #{path}: #{message(reason)}"
 

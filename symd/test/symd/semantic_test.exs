@@ -149,7 +149,12 @@ defmodule Symd.SemanticTest do
       )
 
     assert Semantic.definition(workspace, %{path: path, line: 1, column: 11}) ==
-             {:ok, %{"definitions" => [%{"path" => path, "line" => 1, "column" => 7}]}}
+             {:ok,
+              %{
+                "definitions" => [
+                  %{"path" => path, "line" => 1, "column" => 7, "text" => "const 𝒇 = parse(𝒇)"}
+                ]
+              }}
   end
 
   @tag :tmp_dir
@@ -281,12 +286,69 @@ defmodule Symd.SemanticTest do
                "column" => 17
              }
 
+    # Each reference carries its trimmed source line.
     assert match["refs"] == [
-             %{"path" => declaration, "line" => 1, "column" => 17},
-             %{"path" => usage, "line" => 3, "column" => 11}
+             %{
+               "path" => declaration,
+               "line" => 1,
+               "column" => 17,
+               "text" => "export function parse(input) {}"
+             },
+             %{"path" => usage, "line" => 3, "column" => 11, "text" => "const x = parse(1)"}
            ]
 
     assert_received {:synced, ^declaration}
+  end
+
+  @tag :tmp_dir
+  test "references at a position with no symbol are an error, not an empty answer", %{
+    tmp_dir: dir
+  } do
+    path = Path.join(dir, "blank.ts")
+    File.write!(path, "\n")
+
+    workspace =
+      workspace(
+        sync: fn @typescript, ^path -> File.read(path) end,
+        request: fn @typescript, "textDocument/references", _params -> {:ok, []} end
+      )
+
+    assert Semantic.references(workspace, %{path: path, line: 1, column: 1}) ==
+             {:error, {:no_symbol_at, path, 1, 1}}
+  end
+
+  @tag :tmp_dir
+  test "a group another group already covers is dropped", %{tmp_dir: dir} do
+    # tsserver reports both the declaration and its `export { parse }` entry.
+    path = Path.join(dir, "parser.ts")
+    File.write!(path, "function parse() {}\nparse()\nexport { parse }\n")
+
+    at = fn line, character ->
+      %{
+        "uri" => Uri.from_path(path),
+        "range" => %{"start" => %{"line" => line, "character" => character}}
+      }
+    end
+
+    symbol = fn kind, line, character ->
+      %{"name" => "parse", "kind" => kind, "location" => at.(line, character)}
+    end
+
+    workspace =
+      workspace(
+        root: dir,
+        sync: fn @typescript, ^path -> File.read(path) end,
+        request: fn
+          @typescript, "workspace/symbol", _params ->
+            {:ok, [symbol.(12, 0, 9), symbol.(13, 2, 9)]}
+
+          @typescript, "textDocument/references", _params ->
+            {:ok, [at.(0, 9), at.(1, 0), at.(2, 9)]}
+        end
+      )
+
+    assert {:ok, %{"matches" => [match]}} = Semantic.references(workspace, "parse")
+    assert match["symbol"]["kind"] == "function"
   end
 
   @tag :tmp_dir
@@ -560,7 +622,8 @@ defmodule Symd.SemanticTest do
         end
       )
 
-    assert {:ok, _} =
+    # The fake server finds nothing there, which reads as "no symbol here".
+    assert {:error, {:no_symbol_at, _, 1, 1}} =
              Semantic.references(workspace, %{
                path: Path.join(dir, "src/app.ts"),
                line: 1,

@@ -121,6 +121,14 @@ func TestSemanticRequestsAndLineOutput(t *testing.T) {
 			stdout:  "src/foo.ts:17:5\nsrc/bar.ts:82:11\n",
 		},
 		{
+			name: "--source puts each reference's source line after a tab",
+			args: []string{"--source", "refs", "parse"},
+			reply: `{"ok":true,"result":{"matches":[{"refs":[{"path":"` + here("src/foo.ts") +
+				`","line":17,"column":5,"text":"import { parse } from \"./parser\""}]}]}}`,
+			request: map[string]any{"op": "refs", "name": "parse", "cwd": cwd},
+			stdout:  "src/foo.ts:17:5\timport { parse } from \"./parser\"\n",
+		},
+		{
 			name: "refs with several matches groups per symbol",
 			args: []string{"refs", "parse"},
 			reply: `{"ok":true,"result":{"matches":[` +
@@ -350,5 +358,26 @@ func TestFailedAutoStartReportsTheServiceError(t *testing.T) {
 	code := run(args, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "cannot start symd") {
 		t.Fatalf("exit %d without a startup explanation: %s", code, &stderr)
+	}
+}
+
+// Feedback is a local note file: each note is one line, and the bare flag
+// reads them all back. It never talks to the daemon.
+func TestFeedbackAppendsOneLinePerNoteAndListsThem(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	feedback := func(args ...string) string {
+		var stdout, stderr bytes.Buffer
+		if code := run(append([]string{"--feedback"}, args...), &stdout, &stderr); code != 0 {
+			t.Fatalf("exit %d: %s", code, &stderr)
+		}
+		return stdout.String()
+	}
+	if listed := feedback(); listed != "" {
+		t.Fatalf("nothing written yet, got %q", listed)
+	}
+	feedback("show source lines\nby default")
+	feedback("refs", "misses", "property uses")
+	if listed := feedback(); listed != "show source lines by default\nrefs misses property uses\n" {
+		t.Fatalf("unexpected notes: %q", listed)
 	}
 }

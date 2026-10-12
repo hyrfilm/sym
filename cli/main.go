@@ -49,16 +49,24 @@ func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 // 1 symd or transport failure, 2 bad usage, 3 a name query too ambiguous to
 // answer. Nothing is sent when the arguments are wrong.
 func run(args []string, stdout, stderr io.Writer) int {
+	// --feedback takes free text, or nothing at all to list what was written,
+	// which the flag package can't express; it never reaches the daemon.
+	if len(args) > 0 && (args[0] == "--feedback" || args[0] == "-feedback") {
+		return feedback(args[1:], stdout, stderr)
+	}
 	flags := flag.NewFlagSet("sym", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socket := flags.String("socket", defaultSocket(), "symd Unix socket")
 	service := flags.String("service", siblingService(), "symd executable")
 	asJSON := flags.Bool("json", false, "print the raw result object instead of location lines")
+	source := flags.Bool("source", false, "print each reference's source line after its location, tab-separated")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: sym [options] refs NAME | refs --at FILE:LINE:COL")
 		fmt.Fprintln(stderr, "                     def NAME  | def --at FILE:LINE:COL")
 		fmt.Fprintln(stderr, "                     symbols FILE")
 		fmt.Fprintln(stderr, "                     start | status | stop")
+		fmt.Fprintln(stderr, "       sym --feedback \"TEXT\"   note a wish or a problem with sym")
+		fmt.Fprintln(stderr, "       sym --feedback          list the notes written so far")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -157,7 +165,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	default:
-		return printSemantic(req, reply, *asJSON, stdout, stderr)
+		return printSemantic(req, reply, *asJSON, *source, stdout, stderr)
 	}
 }
 

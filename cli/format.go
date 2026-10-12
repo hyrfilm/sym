@@ -25,6 +25,7 @@ type location struct {
 	Path   string `json:"path"`
 	Line   int    `json:"line"`
 	Column int    `json:"column"`
+	Text   string `json:"text"`
 }
 
 type semanticResult struct {
@@ -42,7 +43,9 @@ type semanticResult struct {
 // symbol descriptions after a tab where they exist. Grouping only appears
 // when a name matched several symbols. Exit codes: 0 answered, 1 failed,
 // 3 too ambiguous to answer (candidates were printed instead).
-func printSemantic(req request, reply response, asJSON bool, stdout, stderr io.Writer) int {
+// With source set, each reference line also carries its source line after a
+// tab, so a reader can tell an import from a call without opening the file.
+func printSemantic(req request, reply response, asJSON, source bool, stdout, stderr io.Writer) int {
 	if !reply.OK {
 		fmt.Fprintf(stderr, "sym: %s: %s\n", reply.Error.Code, reply.Error.Message)
 		return 1
@@ -60,7 +63,7 @@ func printSemantic(req request, reply response, asJSON bool, stdout, stderr io.W
 	if asJSON {
 		fmt.Fprintf(stdout, "%s\n", reply.Result)
 	} else {
-		printLines(req, result, stdout)
+		printLines(req, result, source, stdout)
 	}
 	if ambiguous {
 		return 3
@@ -68,7 +71,7 @@ func printSemantic(req request, reply response, asJSON bool, stdout, stderr io.W
 	return 0
 }
 
-func printLines(req request, result semanticResult, stdout io.Writer) {
+func printLines(req request, result semanticResult, source bool, stdout io.Writer) {
 	base, _ := os.Getwd()
 	switch {
 	case len(result.Candidates) > 0:
@@ -85,7 +88,7 @@ func printLines(req request, result semanticResult, stdout io.Writer) {
 		}
 	case len(result.Matches) == 1:
 		for _, ref := range result.Matches[0].Refs {
-			fmt.Fprintln(stdout, place(base, ref.Path, ref.Line, ref.Column))
+			fmt.Fprintln(stdout, reference(base, ref, source))
 		}
 	default:
 		for index, match := range result.Matches {
@@ -97,7 +100,7 @@ func printLines(req request, result semanticResult, stdout io.Writer) {
 					place(base, match.Symbol.Path, match.Symbol.Line, match.Symbol.Column))
 			}
 			for _, ref := range match.Refs {
-				fmt.Fprintf(stdout, "  %s\n", place(base, ref.Path, ref.Line, ref.Column))
+				fmt.Fprintf(stdout, "  %s\n", reference(base, ref, source))
 			}
 		}
 	}
@@ -111,6 +114,14 @@ func describe(base string, symbol symbolInfo) string {
 		return where
 	}
 	return fmt.Sprintf("%s\t%s (%s)", where, qualified(symbol), symbol.Kind)
+}
+
+func reference(base string, ref location, source bool) string {
+	where := place(base, ref.Path, ref.Line, ref.Column)
+	if !source {
+		return where
+	}
+	return where + "\t" + ref.Text
 }
 
 func qualified(symbol symbolInfo) string {

@@ -106,7 +106,7 @@ defmodule Symd.ServiceTest do
     end
   end
 
-  test "status and stop are tagged control results on protocol 3" do
+  test "status and stop are tagged control results on one protocol" do
     list = [%{"root" => "/repo", "config" => "/repo/sym.toml"}]
 
     assert {:daemon, :status, %{"ok" => true, "result" => status}} =
@@ -114,7 +114,7 @@ defmodule Symd.ServiceTest do
 
     assert %{
              "service" => "symd",
-             "protocol" => 3,
+             "protocol" => protocol,
              "state" => "running",
              "pid" => pid,
              "workspaces" => ^list
@@ -123,7 +123,7 @@ defmodule Symd.ServiceTest do
     assert String.to_integer(pid) > 0
 
     assert {:daemon, :stop,
-            %{"ok" => true, "result" => %{"state" => "stopping", "protocol" => 3}}} =
+            %{"ok" => true, "result" => %{"state" => "stopping", "protocol" => ^protocol}}} =
              Service.handle(%{"op" => "stop"}, untouched_deps())
   end
 

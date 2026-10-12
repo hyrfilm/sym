@@ -67,7 +67,13 @@ defmodule Symd.Semantic do
              "textDocument/references",
              Map.put(params, "context", %{"includeDeclaration" => true})
            ) do
-      {:ok, %{"matches" => [%{"refs" => result |> locations() |> resolve_locations()}]}}
+      # A symbol's references include its own declaration, so an empty answer
+      # means the position was not on a symbol. Said plainly, it can't be
+      # mistaken for "nothing uses this".
+      case result |> locations() |> resolve_locations() do
+        [] -> {:error, {:no_symbol_at, at.path, at.line, at.column}}
+        refs -> {:ok, %{"matches" => [%{"refs" => refs}]}}
+      end
     end
   end
 
@@ -78,7 +84,7 @@ defmodule Symd.Semantic do
         {:ok, %{"candidates" => candidates}}
       else
         with {:ok, groups} <- map_ok(matches, &match_references(workspace, &1)) do
-          {:ok, %{"matches" => groups}}
+          {:ok, %{"matches" => drop_covered(groups)}}
         end
       end
     end
@@ -384,6 +390,22 @@ defmodule Symd.Semantic do
     end
   end
 
+  # tsserver reports the entry in an `export { name }` block as a symbol of its
+  # own. Its references are the declaration's again, or a subset of them, so
+  # its group repeats what another group already says. A group goes when
+  # another one covers it; of two identical groups the first stays.
+  defp drop_covered(groups) do
+    sets = Enum.map(groups, &MapSet.new(&1["refs"]))
+    indexed = Enum.with_index(sets)
+
+    for {{group, refs}, index} <- Enum.with_index(Enum.zip(groups, sets)),
+        not Enum.any?(indexed, fn {other, other_index} ->
+          other_index != index and MapSet.subset?(refs, other) and
+            (refs != other or other_index < index)
+        end),
+        do: group
+  end
+
   # Locations ---------------------------------------------------------------
 
   defp position_params(workspace, %{path: path, line: line, column: column}) do
@@ -437,8 +459,14 @@ defmodule Symd.Semantic do
             {file_lines, cache} = cached_lines(cache, path)
             text = Enum.at(file_lines, line) || ""
 
-            {%{"path" => path, "line" => line + 1, "column" => Position.column(text, character)},
-             cache}
+            # The source line travels with the location, so a reader can tell
+            # an import from a call without opening the file.
+            {%{
+               "path" => path,
+               "line" => line + 1,
+               "column" => Position.column(text, character),
+               "text" => String.trim(text)
+             }, cache}
 
           :error ->
             {nil, cache}
