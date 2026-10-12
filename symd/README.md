@@ -43,7 +43,7 @@ Successful replies use `{"ok":true,"result":{...}}`. Failures use
 prints the error and exits with status 1.
 
 Management requests contain only `op`: `status` or `stop`. Status replies
-include `service: "symd"`, `protocol: 3`, `state: "running"`, the process ID,
+include `service: "symd"`, `protocol: 4`, `state: "running"`, the process ID,
 and the resolved workspaces. Stop replies acknowledge `state: "stopping"`;
 the CLI then waits for socket cleanup.
 
@@ -79,7 +79,11 @@ that a name search covers all of them.
 Queries filter exact matches (a dotted name matches the container, Elixir-style
 `Mod.fun/1` names are normalized), re-anchor on the
 identifier, and group references per symbol up to a cap of five; past it
-they return candidates so the caller narrows instead of waiting. Locations
+they return candidates so the caller narrows instead of waiting. A group
+whose references another group already covers (tsserver's `export { name }`
+entries) is dropped. Each location carries its trimmed source line as
+`text`, and `refs` at a position with no references fails with
+`no_symbol_at`. Locations
 are authoritative; names are search terms. Files are read from disk on every
 query, and location-less or non-`file://` results are dropped rather than
 guessed at.
