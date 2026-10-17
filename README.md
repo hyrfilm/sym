@@ -1,8 +1,8 @@
 # sym
 
-## CLI for quick navigation of codebases using your LSPs of choice
-## for agents
-## (and humans)
+### CLI for quick navigation of codebases using your LSPs of choice
+### for agents
+### (and humans)
 
 
 `sym` finds definitions, references, and the symbols declared in a file.
