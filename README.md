@@ -1,5 +1,10 @@
 # sym
 
+## CLI for quick navigation of codebases using your LSPs of choice
+## for agents
+## (and humans)
+
+
 `sym` finds definitions, references, and the symbols declared in a file.
 It uses language servers to answer questions about code from the command
 line, with output that coding agents and scripts can read.
