@@ -1,9 +1,14 @@
 # sym
 
 ### CLI for quick navigation of codebases using your LSPs of choice
-### for agents
-### (and humans)
+### for agents (and humans)
 
+LSPs (language server protocols) works unsurprisingly much better for agents,
+that otherwise tend to rely on tools like `rg` / `sed` for a lot of their tasks.
+But they tend to be a slow, and chatty - filling up precious tokens with noise.
+Or they are supported in one particular harness as a plug-in but not universally, or
+they require an MCP, or maybe there's not support for some particular language you are
+using - Or you have multi-language repo that you want to be able to efficiently navigate.
 
 `sym` finds definitions, references, and the symbols declared in a file.
 It uses language servers to answer questions about code from the command
